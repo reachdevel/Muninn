@@ -824,3 +824,219 @@ def test_a_refusal_carries_a_machine_readable_reason() -> None:
         assert body["queue_depth"] >= 1
         assert body["worker_state"] in {"idle", "busy", "stuck", "dead"}
         assert int(refused.headers["Retry-After"]) >= 1
+
+
+# ---------------------------- the four defects found in post-P0 testing
+#
+# These are the shapes that survived the first pass. They share one cause: the
+# throttle wait sat between the dequeue and the job, outside everything the
+# service measured, so a healthy throttle-bound queue looked like a dead
+# dispatcher - and a queue nobody was measuring cannot be bounded or refused.
+
+
+async def test_a_non_empty_queue_always_has_a_worker_holding_a_job() -> None:
+    """Defect 1: workers reporting idle while the queue is full.
+
+    Throttle deliberately longer than the fetch, which is the real ratio: 15-30s
+    of politeness against a 5-18s engine. Under that ratio almost every sample
+    found both workers "idle" with jobs queued, which is indistinguishable from a
+    lost wakeup - and there was no lost wakeup, only a throttle sleep that did not
+    report itself.
+    """
+    driver = ControllableDriver()
+    driver.latency = 0.25
+    service, _engines, _settings = await make_service(
+        driver,
+        search_worker_count=2,
+        search_max_concurrent_per_engine=1,
+        # Throttle several times the fetch, which is the ratio that matters: the
+        # first fetch never waits, every one after it waits most of its life.
+        throttle_min_delay=0.6,
+        throttle_max_delay=0.9,
+        search_job_deadline_seconds=30,
+        search_queue_wait_deadline_seconds=30,
+        request_timeout_seconds=60,
+    )
+    try:
+        violations: list[tuple[int, list[str]]] = []
+        sampling = True
+
+        async def sample() -> None:
+            while sampling:
+                depth = service.queue_depth
+                states = [w.state for w in service._workers.values()]
+                if depth > 0 and all(s == "idle" for s in states):
+                    violations.append((depth, states))
+                await asyncio.sleep(0.02)
+
+        sampler = asyncio.ensure_future(sample())
+        await asyncio.gather(
+            *(
+                service.submit(query=f"burst {i}", max_results=10,
+                               requested_engine=None, force_refresh=False)
+                for i in range(8)
+            )
+        )
+        sampling = False
+        await asyncio.gather(sampler, return_exceptions=True)
+
+        assert not violations, (
+            f"{len(violations)} samples had queued jobs and no worker holding any: "
+            f"the dispatcher (or the reporting) is broken again"
+        )
+        assert service.queue_depth == 0
+    finally:
+        await stop_service(service)
+
+
+async def test_a_throttled_worker_says_so() -> None:
+    """The state that makes the invariant above checkable."""
+    driver = ControllableDriver()
+    driver.latency = 0.1
+    service, _engines, _settings = await make_service(
+        driver,
+        search_worker_count=1,
+        throttle_min_delay=1.0,
+        throttle_max_delay=1.0,
+    )
+    try:
+        # The first fetch is never throttled, so warm the clock up first.
+        await service.submit(query="warm up", max_results=10,
+                             requested_engine=None, force_refresh=False)
+
+        seen: list[str] = []
+        pending = asyncio.ensure_future(
+            service.submit(query="throttle me", max_results=10,
+                           requested_engine=None, force_refresh=False)
+        )
+        for _ in range(40):
+            seen.append(service.worker_state())
+            await asyncio.sleep(0.05)
+        await pending
+        assert "throttled" in seen, f"never reported the throttle wait: {set(seen)}"
+        assert "busy" in seen
+        assert service.worker_status()["state"] == "idle"
+    finally:
+        await stop_service(service)
+
+
+async def test_a_job_that_cannot_start_fails_fast_instead_of_hanging() -> None:
+    """Defect 2: the deadline only covered execution, so a job that never got
+    dispatched was never killed - the caller just waited."""
+    driver = ControllableDriver()
+    service, _engines, settings = await make_service(
+        driver,
+        search_worker_count=1,
+        throttle_min_delay=30.0,
+        throttle_max_delay=30.0,
+        search_queue_wait_deadline_seconds=1.0,
+        search_job_deadline_seconds=30.0,
+        request_timeout_seconds=30,
+    )
+    try:
+        # Occupy the single worker, then queue behind it.
+        held = asyncio.ensure_future(
+            service.submit(query="held", max_results=10,
+                           requested_engine=None, force_refresh=False)
+        )
+        await asyncio.sleep(0.05)
+
+        started = perf_counter()
+        with pytest.raises(SearchUnavailableError) as caught:
+            await service.submit(query="will never start", max_results=10,
+                                 requested_engine=None, force_refresh=False)
+        waited = perf_counter() - started
+
+        assert caught.value.reason == "queue_wait_timeout"
+        # Fast, and long before the caller's own timeout.
+        assert waited < 2.0, f"took {waited:.2f}s to refuse"
+        assert waited < float(settings.request_timeout_seconds)
+        assert service.metrics.jobs_queue_wait_timed_out >= 1
+        # A refusal, not a failure: nothing ran, so the caller should defer.
+        assert not isinstance(caught.value, SearchJobFailedError)
+
+        held.cancel()
+        await asyncio.gather(held, return_exceptions=True)
+    finally:
+        await stop_service(service)
+
+
+def test_the_breaker_opens_when_nothing_picks_up_the_queue() -> None:
+    """Defect 3: an idle pool over a full queue is a provable deadlock."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    breaker.observe(depth=4, stuck=False, dispatcher_stalled=True)
+    assert breaker.state == "open"
+    assert breaker.snapshot()["reason"] == "no_worker_picking_up"
+    # ...and it recovers on a probe rather than latching.
+    clock.advance(10)
+    assert breaker.admit().probe is True
+    breaker.note_job_completed()
+    assert breaker.state == "closed"
+
+
+async def test_the_supervisor_notices_a_dispatcher_that_stopped_picking_up() -> None:
+    """The wiring, not just the predicate.
+
+    Models a *live* worker pool that has stopped taking jobs - the lost-wakeup
+    shape - rather than a dead one, because the supervisor would replace a dead
+    worker and there would be nothing to notice. With the supervisor stopped (so
+    it cannot quietly fix things) and the workers parked, a full queue is exactly
+    the signature the breaker exists for.
+    """
+    service, _engines, _settings = await make_service(
+        ControllableDriver(), search_worker_count=2
+    )
+    try:
+        monitor = service._monitor_task  # noqa: SLF001
+        assert monitor is not None
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+
+        # Park the workers: alive, idle, and not looking at the queue.
+        for worker in service._workers.values():  # noqa: SLF001
+            worker.task.cancel()
+            await asyncio.gather(worker.task, return_exceptions=True)
+            worker.task = asyncio.ensure_future(asyncio.sleep(3600))
+
+        service._queue.put_nowait(  # noqa: SLF001
+            SearchJob(query="orphan", max_results=10,
+                      requested_engine=None, force_refresh=False)
+        )
+
+        assert service._dispatcher_stalled(1) is True  # noqa: SLF001
+        service._monitor_tick()  # noqa: SLF001
+
+        assert service.breaker.state == "open"
+        assert service.breaker.snapshot()["reason"] == "no_worker_picking_up"
+        started = perf_counter()
+        with pytest.raises(SearchUnavailableError):
+            await service.submit(query="refused", max_results=10,
+                                 requested_engine=None, force_refresh=False)
+        assert perf_counter() - started < 0.5, "the refusal must be immediate"
+    finally:
+        await stop_service(service)
+
+
+def test_the_app_middleware_does_not_swallow_client_disconnects() -> None:
+    """Defect 4, structurally.
+
+    ``Request.is_disconnected()`` never returns True when the app wraps requests
+    in Starlette's ``BaseHTTPMiddleware``, because that layer re-plumbs the
+    server's ``receive`` channel and drops ``http.disconnect``. The symptom was
+    ``jobs_abandoned`` stuck at 0 forever: five socket-level hang-ups, zero
+    detected. A pure-ASGI middleware keeps ``receive`` intact.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    from app.main import create_app
+    from tests.conftest import FakeDriver, make_test_settings
+
+    app = create_app(settings=make_test_settings(), driver_factory=lambda s: FakeDriver())
+    layers = list(app.user_middleware)  # type: ignore[attr-defined]
+    assert layers, "the request-context middleware is missing entirely"
+    for layer in layers:
+        assert not issubclass(layer.cls, BaseHTTPMiddleware), (
+            f"{layer.cls.__name__} is a BaseHTTPMiddleware: /search cannot see a "
+            f"client disconnect through it"
+        )

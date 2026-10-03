@@ -81,6 +81,20 @@ groups:
             Jobs in the last 10m hit SEARCH_JOB_DEADLINE_SECONDS. Split by the
             `engine` label to find the one that is not answering.
 
+      - alert: MuninnSearchDispatcherStalled
+        expr: muninn_search_worker_state == 0 and muninn_search_queue_depth > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Search queue is non-empty and no worker is holding a job"
+          description: >-
+            Every worker reports idle while jobs are queued. That is not the
+            throttle - a waiting worker reports `throttled` (state 2) - so the
+            workers and the queue have lost contact. Check
+            muninn_search_worker_restarts_total and the application log; the
+            breaker opens on this within a sampling interval.
+
       - alert: MuninnSearchRefusalsSustained
         expr: sum(rate(muninn_search_breaker_rejections_total[5m])) > 0
         for: 10m

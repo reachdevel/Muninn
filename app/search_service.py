@@ -53,7 +53,12 @@ from app.cache import SearchCache
 from app.config import Settings
 from app.engine_manager import AllEnginesQuarantinedError, EngineManager
 from app.models import SearchResponse
-from app.search_breaker import REASON_QUEUE_FULL, Admission, SearchBreaker
+from app.search_breaker import (
+    REASON_QUEUE_FULL,
+    REASON_QUEUE_WAIT_TIMEOUT,
+    Admission,
+    SearchBreaker,
+)
 from drivers.browser_driver import BrowserDriver
 from drivers.parsers import EngineBlockedError, get_parser
 from ops.metrics import Registry
@@ -63,22 +68,26 @@ logger = logging.getLogger(__name__)
 #: Worker states, mirrored by the ``muninn_search_worker_state`` gauge.
 WORKER_IDLE = "idle"
 WORKER_BUSY = "busy"
+WORKER_THROTTLED = "throttled"
 WORKER_STUCK = "stuck"
 WORKER_DEAD = "dead"
 
 WORKER_GAUGE_VALUES: dict[str, int] = {
     WORKER_IDLE: 0,
     WORKER_BUSY: 1,
-    WORKER_STUCK: 2,
-    WORKER_DEAD: 3,
+    WORKER_THROTTLED: 2,
+    WORKER_STUCK: 3,
+    WORKER_DEAD: 4,
 }
 
-# Aggregate worker state, worst first: a dead worker outranks a stuck one, and
-# that outranks a busy one, so the number on /health is never optimistic.
-_WORKER_SEVERITY = (WORKER_DEAD, WORKER_STUCK, WORKER_BUSY, WORKER_IDLE)
+# Aggregate worker state, worst first: a dead worker outranks a stuck one, that
+# outranks a busy one, and a throttled worker outranks an idle one. The order
+# matters for the dispatcher's health check: "the queue is not empty and every
+# worker is idle" is only a deadlock if throttling is reported as its own state.
+_WORKER_SEVERITY = (WORKER_DEAD, WORKER_STUCK, WORKER_BUSY, WORKER_THROTTLED, WORKER_IDLE)
 
 # Refusal reasons that are about the queue rather than the breaker's opinion.
-_QUEUE_REJECTIONS = frozenset({REASON_QUEUE_FULL})
+_QUEUE_REJECTIONS = frozenset({REASON_QUEUE_FULL, REASON_QUEUE_WAIT_TIMEOUT})
 
 
 @dataclass
@@ -97,6 +106,11 @@ class SearchJob:
     abandoned: bool = False
     #: The task running this job, so abandonment can cancel it mid-flight.
     task: asyncio.Task | None = None
+    #: The worker holding this job, so the throttle wait can be reported.
+    worker: _Worker | None = None
+    #: Monotonic time execution began (after the throttle), which is what the
+    #: caller's queue-wait deadline is measured against.
+    started_at: float | None = None
 
 
 @dataclass
@@ -112,6 +126,7 @@ class Metrics:
     cache_write_skips: int = 0
     breaker_rejections: int = 0
     jobs_deadline_killed: int = 0
+    jobs_queue_wait_timed_out: int = 0
     jobs_abandoned: int = 0
     jobs_failed: int = 0
     worker_restarts: int = 0
@@ -127,6 +142,7 @@ class Metrics:
             "cache_write_skips": self.cache_write_skips,
             "breaker_rejections": self.breaker_rejections,
             "jobs_deadline_killed": self.jobs_deadline_killed,
+            "jobs_queue_wait_timed_out": self.jobs_queue_wait_timed_out,
             "jobs_abandoned": self.jobs_abandoned,
             "jobs_failed": self.jobs_failed,
             "worker_restarts": self.worker_restarts,
@@ -213,6 +229,16 @@ class _Worker:
     def begin(self, now: float) -> None:
         self.state = WORKER_BUSY
         self.job_started_at = now
+
+    def throttle(self) -> None:
+        """Holding a job, deliberately waiting for the throttle slot."""
+        if self.state != WORKER_STUCK:
+            self.state = WORKER_THROTTLED
+
+    def execute(self) -> None:
+        """Holding a job and fetching from an engine now."""
+        if self.state != WORKER_STUCK:
+            self.state = WORKER_BUSY
 
     def finish(self, now: float) -> None:
         self.state = WORKER_IDLE
@@ -307,24 +333,23 @@ class SearchService:
         """Every job must resolve before the caller's read timeout fires.
 
         The client and Muninn both cap a search at ``REQUEST_TIMEOUT_SECONDS``
-        and race for the finish line, so a caller cannot tell "slow" from
-        "dead". If the throttle plus the job deadline can exceed it, the
-        configured budgets are wrong and the operator should hear about it at
-        startup rather than in an incident.
+        The client and Muninn both cap a search at ``REQUEST_TIMEOUT_SECONDS`` and
+        race for the finish line, so a caller cannot tell "slow" from "dead". A
+        job's worst case is its queue wait - which includes the throttle - plus
+        its execution; if that can reach the caller's timeout, the budgets are
+        wrong and the operator should hear about it at startup rather than in an
+        incident.
         """
-        throttle = max(
-            self._settings.throttle_min_delay, self._settings.throttle_max_delay
-        )
-        worst = throttle + float(self._settings.search_job_deadline_seconds)
+        queue_wait = float(self._settings.search_queue_wait_deadline_seconds)
+        job_deadline = float(self._settings.search_job_deadline_seconds)
+        worst = queue_wait + job_deadline
         if worst >= float(self._settings.request_timeout_seconds):
             logger.warning(
-                "throttle (%.0fs) + job deadline (%.0fs) can exceed "
+                "queue wait (%.0fs) + job deadline (%.0fs) can reach "
                 "REQUEST_TIMEOUT_SECONDS (%.0fs): callers will give up before the "
-                "worker does. Lower SEARCH_JOB_DEADLINE_SECONDS or raise "
-                "REQUEST_TIMEOUT_SECONDS.",
-                throttle,
-                self._settings.search_job_deadline_seconds,
-                self._settings.request_timeout_seconds,
+                "worker does. Lower SEARCH_QUEUE_WAIT_DEADLINE_SECONDS or "
+                "SEARCH_JOB_DEADLINE_SECONDS, or raise REQUEST_TIMEOUT_SECONDS.",
+                queue_wait, job_deadline, self._settings.request_timeout_seconds,
             )
 
     def _spawn_worker(self, index: int) -> None:
@@ -460,7 +485,9 @@ class SearchService:
             max_results=max_results,
             requested_engine=requested_engine,
             force_refresh=force_refresh,
-            enqueued_at=perf_counter(),
+            # Monotonic, not perf_counter: this anchors deadlines that are
+            # compared against the event loop's clock.
+            enqueued_at=time.monotonic(),
         )
         try:
             self._queue.put_nowait(job)
@@ -493,21 +520,56 @@ class SearchService:
     ) -> SearchResponse:
         """Wait for the worker to settle ``job``, or give up on our own terms.
 
+        Two deadlines, because they mean different things to the caller:
+
+        * the **queue-wait deadline** - the job has not begun executing by now, so
+          it never will in time. That is a 503: nothing ran, and the answer is
+          "come back later", not a failure to report.
+        * the **request timeout** - the job has had its whole turn and still has
+          not produced an answer. That is a 504.
+
         The future is awaited through a shield on purpose: ``wait_for`` cancels
-        the awaitable it is given on timeout, and that cancellation used to
-        reach the worker, which then died trying to resolve a future nobody
-        could receive any more.
+        the awaitable it is given on timeout, and that cancellation used to reach
+        the worker, which then died trying to resolve a future nobody could
+        receive any more.
         """
         timeout = max(1.0, float(self._settings.request_timeout_seconds))
-        poll = 1.0 if disconnect_check is not None else timeout
+        wait_budget = max(0.0, float(self._settings.search_queue_wait_deadline_seconds))
+        # Absolute monotonic deadline, not a duration: this is compared against
+        # the clock, so it has to be a point in time.
+        already_waited = time.monotonic() - (job.enqueued_at or time.monotonic())
+        start_deadline = (
+            time.monotonic() + max(0.0, wait_budget - already_waited)
+            if wait_budget
+            else None
+        )
+        request_deadline = time.monotonic() + timeout
         waiter = asyncio.shield(job.future)
-        deadline = time.monotonic() + timeout
         try:
             while True:
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                if job.started_at is not None:
+                    # Execution started, so the queue-wait deadline has served
+                    # its purpose and the job deadline governs from here.
+                    start_deadline = None
+                elif start_deadline is not None and now >= start_deadline:
+                    # Nothing has even begun: this is a refusal, not a failure.
+                    self.metrics.jobs_queue_wait_timed_out += 1
+                    if self._registry is not None:
+                        self._registry.increment("muninn_search_queue_wait_timeouts_total")
+                    raise self._refusal(
+                        Admission(
+                            admitted=False,
+                            reason=REASON_QUEUE_WAIT_TIMEOUT,
+                            state=self._breaker.state,
+                        )
+                    )
+                remaining = request_deadline - now
                 if remaining <= 0:
                     raise TimeoutError("search timed out in the queue")
-                done, _ = await asyncio.wait({waiter}, timeout=min(poll, remaining))
+                # Poll often enough to notice a start, a disconnect and the
+                # queue-wait deadline promptly. All three are in-memory checks.
+                done, _ = await asyncio.wait({waiter}, timeout=min(0.5, remaining))
                 if done:
                     # May raise the job's own error; that is the caller's answer.
                     return waiter.result()
@@ -569,7 +631,16 @@ class SearchService:
     # -- workers ------------------------------------------------------------
 
     async def _worker_loop(self, index: int) -> None:
-        """Drain the queue, one job at a time, under the hard job deadline."""
+        """Drain the queue, one job at a time, under the hard job deadline.
+
+        The worker takes a job, *immediately* records itself as holding it, and
+        only then starts the job's task. The throttle wait used to happen here,
+        between the dequeue and the job, which made a worker waiting its turn
+        look idle while the queue was full: a healthy throttle-bound queue was
+        indistinguishable from a dead dispatcher, and a job abandoned during that
+        window could not be cancelled. Everything from the dequeue on now belongs
+        to the job.
+        """
         worker = self._workers[index]
         while True:
             job = await self._queue.get()
@@ -578,13 +649,18 @@ class SearchService:
                     # The caller already gave up. Skipping it is what keeps
                     # abandoned requests from consuming the worker.
                     continue
-                await self._throttle()
+                now = time.monotonic()
+                worker.begin(now)
+                self._last_progress_at = now
+                job.worker = worker
                 await self._run_job(worker, job)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - one bad job, not the worker
                 logger.exception("search worker %d hit an unexpected error", index)
             finally:
+                job.worker = None
+                worker.finish(time.monotonic())
                 self._queue.task_done()
 
     async def _run_job(self, worker: _Worker, job: SearchJob) -> None:
@@ -597,9 +673,7 @@ class SearchService:
         task = asyncio.ensure_future(self._execute(job))
         job.task = task
         started = time.monotonic()
-        worker.begin(started)
-        self._last_progress_at = started
-        self._observe_queue_wait(job)
+        self._observe_queue_wait(job, started)
 
         response: SearchResponse | None = None
         error: BaseException | None = None
@@ -631,7 +705,6 @@ class SearchService:
             logger.warning("job failed for query=%r: %s", job.query, exc)
         finally:
             now = time.monotonic()
-            worker.finish(now)
             self._last_progress_at = now
             if outcome == "served":
                 worker.jobs_completed += 1
@@ -694,7 +767,7 @@ class SearchService:
             # abandoned request.
             job.future.exception()
 
-    async def _throttle(self) -> None:
+    async def _throttle(self, job: SearchJob) -> None:
         """Wait a randomized 15-30s since the previous outbound fetch.
 
         Serialised by a lock, deliberately: with one worker the spacing was free,
@@ -703,7 +776,13 @@ class SearchService:
         exact thing the throttle exists to prevent. Only the *wait* is locked; the
         fetch itself happens after the lock is released, so a hanging engine
         cannot hold up anyone else's outbound request.
+
+        The wait counts against the caller's queue-wait deadline: a job sitting in
+        the throttle is not making progress, however healthy the reason is.
         """
+        worker = job.worker
+        if worker is not None:
+            worker.throttle()
         async with self._throttle_lock:
             delay = random.uniform(
                 self._settings.throttle_min_delay, self._settings.throttle_max_delay
@@ -716,9 +795,19 @@ class SearchService:
                     logger.debug("throttling %.1fs until next outbound request", remaining)
                     await asyncio.sleep(remaining)
             self._last_fetch_started = time.monotonic()
+        if worker is not None:
+            worker.execute()
 
     async def _execute(self, job: SearchJob) -> SearchResponse:
-        """Run the job against active engines until one succeeds."""
+        """Run the job against active engines until one succeeds.
+
+        The throttle wait is the first thing in here, not something the worker
+        did before creating this task. Two reasons: a job that is waiting for its
+        turn is holding a worker and must say so, and a caller that gives up
+        during the wait must be able to cancel it.
+        """
+        await self._throttle(job)
+        job.started_at = time.monotonic()
         engine_pool_size = len(self._engines.engines)
         for _ in range(engine_pool_size):
             engine = await self._reserve_engine(job.requested_engine)
@@ -808,17 +897,25 @@ class SearchService:
     # -- supervision --------------------------------------------------------
 
     async def _monitor_loop(self) -> None:
-        """Watch the workers: replace the dead, notice the stuck, fail the rest."""
+        """Sample the queue and the workers until cancelled."""
         interval = max(0.5, float(self._settings.search_monitor_interval_seconds))
         while True:
             await asyncio.sleep(interval)
             try:
-                self._supervise()
-                self._refresh_worker_ages()
-                depth = self._queue.qsize()
-                self._breaker.observe(depth=depth, stuck=self._queue_stuck(depth))
+                self._monitor_tick()
             except Exception:  # pragma: no cover - the supervisor must not die
                 logger.warning("search supervisor tick failed", exc_info=True)
+
+    def _monitor_tick(self) -> None:
+        """One supervision pass: replace the dead, notice the stuck, judge it."""
+        self._supervise()
+        self._refresh_worker_ages()
+        depth = self._queue.qsize()
+        self._breaker.observe(
+            depth=depth,
+            stuck=self._queue_stuck(depth),
+            dispatcher_stalled=self._dispatcher_stalled(depth),
+        )
 
     def _supervise(self) -> None:
         """Replace a worker that died, failing whatever it left queued."""
@@ -891,19 +988,36 @@ class SearchService:
         stall = max(1.0, float(self._settings.search_breaker_stall_seconds))
         return (time.monotonic() - self._last_progress_at) >= stall
 
+    def _dispatcher_stalled(self, depth: int) -> bool:
+        """A non-empty queue that no worker has picked up: a broken dispatcher.
+
+        This is the signature that matters and the one that cannot be argued
+        with: while jobs sit in the queue, every worker must be holding one
+        (running it or waiting for its throttle slot). All of them idle means the
+        workers and the queue have lost contact - a lost wakeup, a crashed worker
+        the supervisor has not replaced yet, or a bug in this file.
+
+        It only became checkable once the throttle wait stopped reporting itself
+        as idle: before that, a perfectly healthy throttle-bound queue showed up
+        here on most samples, and the check would have been noise.
+        """
+        if depth <= 0:
+            return False
+        return all(w.state == WORKER_IDLE for w in self._workers.values())
+
     # -- metrics ------------------------------------------------------------
 
-    def _observe_queue_wait(self, job: SearchJob) -> None:
+    def _observe_queue_wait(self, job: SearchJob, now: float) -> None:
         """How long the job sat in the queue before a worker picked it up.
 
-        This is the throttle, not the engine, so it is the number that answers
-        "why is search slow" - and it was declared but never recorded until the
-        queue could stop draining unnoticed.
+        This is the throttle plus any backlog, not the engine, so it is the
+        number that answers "why is search slow" - and it was declared but never
+        recorded until the queue could stop draining unnoticed.
         """
         if self._registry is None or job.enqueued_at is None:
             return
         self._registry.observe(
-            "muninn_search_queue_wait_seconds", max(0.0, perf_counter() - job.enqueued_at)
+            "muninn_search_queue_wait_seconds", max(0.0, now - job.enqueued_at)
         )
 
     def _observe_job(self, duration: float, outcome: str) -> None:

@@ -11,10 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -25,6 +23,7 @@ from app.config import SUPPORTED_ENGINES, Settings, get_settings
 from app.engine_manager import AllEnginesQuarantinedError, EngineManager
 from app.engine_state_store import EngineStateStore
 from app.models import SearchResponse
+from app.request_context import install as install_middleware
 from app.search_service import (
     ClientDisconnectedError,
     EngineQuarantinedError,
@@ -561,38 +560,11 @@ def create_app(
     app.include_router(health_router)
     app.include_router(metrics_router)
 
-    # Unhandled exceptions: return a JSON envelope with a request id instead of
-    # Starlette's plain-text 500 and stack trace. The id is echoed in the
-    # response, put in the X-Request-Id header, and included in the log record,
-    # so an operator can find the traceback without exposing internals to the
-    # caller. Errors we raise deliberately (HTTPException and the explicit
-    # JSONResponse bodies) are unaffected - their documented shapes still stand.
-    @app.middleware("http")
-    async def request_id_middleware(request: Request, call_next: Callable[[Request], Any]) -> Any:
-        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
-        request.state.request_id = request_id
-        # Skip the probe endpoints so scrapes do not inflate their own numbers.
-        endpoint = request.url.path
-        measured = endpoint not in {"/health/live", "/metrics"}
-        started = time.perf_counter()
-        try:
-            response = await call_next(request)
-            if measured:
-                _record(metrics, endpoint, response.status_code, time.perf_counter() - started)
-        except Exception:
-            logger.exception("unhandled error [request_id=%s] %s %s",
-                             request_id, request.method, request.url.path)
-            return JSONResponse(
-                status_code=500,
-                headers={"X-Request-Id": request_id},
-                content={
-                    "error": "internal_error",
-                    "detail": "an unexpected error occurred",
-                    "request_id": request_id,
-                },
-            )
-        response.headers["X-Request-Id"] = request_id
-        return response
+    # Request id, timing and the JSON 500 envelope live in app/request_context.py
+    # because they have to be *pure ASGI*: Starlette's BaseHTTPMiddleware (what
+    # @app.middleware("http") builds) swallows the server's http.disconnect
+    # message, which silently disabled client-disconnect detection on /search.
+    install_middleware(app, lambda path, status, duration: _record(metrics, path, status, duration))
 
     return app
 

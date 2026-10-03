@@ -384,11 +384,14 @@ Everything is an environment variable; the full list with defaults lives in
 
 These exist because the search path could wedge completely while `/health/*` and
 `/scrape` stayed fast: one hung engine call pinned the only worker, the queue
-stopped draining, and every query still waited its full 120 s before `504`.
+stopped draining, and every query still waited its full 120 s before `504`. They
+also exist because a *healthy* throttle-bound queue used to look exactly like
+that wedge — see [below](#why-a-full-queue-with-idle-workers-is-not-a-dead-dispatcher).
 
 | Variable | Default | Description |
 |---|---|---|
-| `SEARCH_JOB_DEADLINE_SECONDS` | `45.0` | Hard deadline for one job (every engine attempt and retry). On expiry the job is killed, the engine in flight is charged a failure, and the worker is released |
+| `SEARCH_JOB_DEADLINE_SECONDS` | `45.0` | Hard deadline for one job once it starts executing (every engine attempt and retry). On expiry the job is killed, the engine in flight is charged a failure, and the worker is released |
+| `SEARCH_QUEUE_WAIT_DEADLINE_SECONDS` | `45.0` | A job must start executing within this long of being enqueued; the throttle wait counts against it. Expiry is a fast `503` (nothing ran) |
 | `SEARCH_WORKER_COUNT` | `2` | Workers draining the queue; more than one keeps a hanging engine from taking the whole pool |
 | `SEARCH_MAX_CONCURRENT_PER_ENGINE` | `1` | Jobs allowed against one engine at a time |
 | `SEARCH_WORKER_STALL_GRACE_SECONDS` | `30.0` | Grace over the job deadline before a busy worker is called stuck |
@@ -469,17 +472,21 @@ which `/health` and `/scrape` stayed fast while every search returned 504 after
 the caller's own timeout:
 
 1. **Every job runs under a hard deadline** (`SEARCH_JOB_DEADLINE_SECONDS`,
-   default 45 s) covering every engine attempt and retry. On expiry the job is
-   aborted, the engine that was in flight is charged one failure, and the worker
-   is released — the service heals itself instead of waiting for an operator.
+   default 45 s) covering every engine attempt and retry, and a second one for
+   the queue wait (`SEARCH_QUEUE_WAIT_DEADLINE_SECONDS`, also 45 s, measured
+   from enqueue to *starting*, throttle included). On expiry the job is aborted,
+   the engine in flight is charged one failure, and the worker is released. A
+   job that never got its turn is refused with `503` instead of hanging, because
+   nothing ran and the caller should come back later rather than spend budget.
 2. **Workers are supervised.** A worker that dies is replaced and the queue
    entries it left behind are failed rather than left to rot. (This one was a
    real bug: a worker resolving a future whose caller had already given up raised
    `InvalidStateError` inside its own error handler and took the only worker with
    it, after which the queue never drained again.)
 3. **A load breaker refuses fast.** When the queue is full, or the workers stop
-   draining, new work is turned away in milliseconds with `503` and a
-   machine-readable `reason` — instead of joining a queue that cannot empty.
+   draining — including the deadlock signature, a full queue with no worker
+   holding a job — new work is turned away in milliseconds with `503` and a
+   machine-readable `reason`, instead of joining a queue that cannot empty.
    After `SEARCH_BREAKER_OPEN_SECONDS` the breaker goes half-open and admits
    exactly one probe: if that job completes, traffic resumes; if it fails, the
    breaker re-opens with a longer backoff. Readiness deliberately ignores the
@@ -511,6 +518,22 @@ cleanly. Its idle shutdown is deterministic: it snapshots its process tree
 before teardown, then a detached reaper SIGKILLs the node driver and every
 Chromium process — including any that detached into their own process group — so
 a stop never leaves browser processes behind.
+
+### Why a full queue with idle workers is not a dead dispatcher
+
+The first version of the worker pool waited for the throttle **outside** the job:
+it dequeued a request, slept 15-30 s for its turn, and only then started working
+on it. Because nothing marked the worker as busy during that sleep, `/health`
+reported `worker: idle` while the queue held six jobs — which is exactly the
+signature of a lost wakeup, and sent the investigation after a dispatcher bug
+that did not exist. The queue was draining the whole time, at the throttle rate.
+
+Two consequences, both now fixed: the throttle wait is part of the job (so it is
+reported as `worker: throttled`, and an abandoned caller can cancel it), and
+"queue not empty, every worker idle" became a real checkable condition
+(`no_worker_picking_up`) rather than an ambiguous one.
+
+If you see that state now, it is a genuine dispatcher fault, not politeness.
 
 ---
 
@@ -626,10 +649,11 @@ What is exported, and why those numbers:
 | `muninn_search_job_seconds{outcome}` | histogram | how long a job actually ran, split by outcome (`served`, `deadline`, `quarantined`, `failed`, `abandoned`) |
 | `muninn_search_jobs_total{outcome}` | counter | the same split as counts |
 | `muninn_search_deadline_kills_total{engine}` | counter | **jobs killed by the job deadline** — the leading indicator of a search path about to stop draining |
+| `muninn_search_queue_wait_timeouts_total` | counter | jobs refused because they never got a worker in time; on a throttle-bound service this is the honest measure of over-subscription |
 | `muninn_engine_total{engine,outcome}` | counter | attempts per engine by outcome, where the failure label is the class (`block`, `timeout`, `network`, `parse`) — so "9 failures, 0 successes" is visible from metrics |
 | `muninn_search_breaker_state` | gauge | `0` closed, `1` half-open (probing), `2` open (refusing) |
 | `muninn_search_breaker_trips_total{reason}`, `muninn_search_breaker_rejections_total{reason}` | counter | why the breaker opened, and what it refused |
-| `muninn_search_worker_state` | gauge | worst worker state: `0` idle, `1` busy, `2` stuck, `3` dead |
+| `muninn_search_worker_state` | gauge | worst worker state: `0` idle, `1` busy, `2` throttled, `3` stuck, `4` dead |
 | `muninn_search_workers`, `muninn_search_worker_restarts_total` | gauge / counter | pool size, and how often the supervisor had to replace one |
 | `muninn_search_queue_stuck` | gauge | `1` when the queue is non-empty and nothing has completed recently — the wedge, as a number |
 | `muninn_scrape_leg_seconds{leg}` | histogram | `fast_path` vs `render` — shows what browser escalations cost |

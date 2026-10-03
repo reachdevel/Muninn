@@ -75,8 +75,11 @@ def make_test_settings(**overrides) -> Settings:
         "max_search_queue": 1_000,
         # Short job deadline so a test that stalls an engine settles fast, and
         # coherent with request_timeout_seconds above (the service warns at
-        # startup when throttle + deadline can outlast the caller).
+        # startup when the two together can outlast the caller).
         "search_job_deadline_seconds": 5.0,
+        # Same for the queue wait: tests must not inherit a production-sized
+        # budget and fail on a queue-wait refusal instead of what they test.
+        "search_queue_wait_deadline_seconds": 5.0,
         # The supervisor samples fast here so a test does not have to sleep for
         # the production interval to notice a dead worker.
         "search_monitor_interval_seconds": 0.5,

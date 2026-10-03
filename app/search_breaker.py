@@ -50,7 +50,9 @@ GAUGE_VALUES: dict[str, int] = {CLOSED: 0, HALF_OPEN: 1, OPEN: 2}
 REASON_BREAKER_OPEN = "breaker_open"
 REASON_PROBE_IN_FLIGHT = "probe_in_flight"
 REASON_QUEUE_FULL = "queue_full"
+REASON_QUEUE_WAIT_TIMEOUT = "queue_wait_timeout"
 REASON_NOT_DRAINING = "not_draining"
+REASON_NO_WORKER_PICKING_UP = "no_worker_picking_up"
 REASON_WORKER_STUCK = "worker_stuck"
 REASON_WORKER_DIED = "worker_died"
 REASON_JOB_DEADLINE = "job_deadline"
@@ -200,8 +202,18 @@ class SearchBreaker:
         if failed_probe or self._failures >= self._threshold:
             self.trip(reason)
 
-    def observe(self, *, depth: int, stuck: bool) -> None:
-        """Supervisor tick: the queue is not draining, or a worker will not move."""
+    def observe(self, *, depth: int, stuck: bool, dispatcher_stalled: bool = False) -> None:
+        """Supervisor tick.
+
+        ``dispatcher_stalled`` is the one condition that needs no judgement
+        call: a non-empty queue while *every* worker reports itself idle means no
+        worker has taken a job, which is a broken dispatcher rather than a slow
+        one. It cannot fire spuriously while the throttle wait is reported as
+        its own state, which is why the worker reports it.
+        """
+        if dispatcher_stalled:
+            self.trip(REASON_NO_WORKER_PICKING_UP)
+            return
         if stuck:
             self.trip(REASON_NOT_DRAINING if depth > 0 else REASON_WORKER_STUCK)
             return

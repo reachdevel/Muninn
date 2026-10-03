@@ -76,6 +76,14 @@ class Settings:
     search_job_deadline_seconds: float = field(
         default_factory=lambda: _env_float("SEARCH_JOB_DEADLINE_SECONDS", 45.0)
     )
+    # A job must BEGIN executing within this long of being enqueued. The throttle
+    # wait counts against it: a job waiting its turn is not making progress, and
+    # on a throttle-bound service a queue that cannot start a job inside this
+    # window never will. Expiry is a fast 503 (come back later), not a 504 - the
+    # job never ran, so nothing failed.
+    search_queue_wait_deadline_seconds: float = field(
+        default_factory=lambda: _env_float("SEARCH_QUEUE_WAIT_DEADLINE_SECONDS", 45.0)
+    )
     # Workers draining the queue. More than one isolates a hanging engine: it
     # can only occupy one worker, so the healthy engines keep serving.
     search_worker_count: int = field(default_factory=lambda: _env_int("SEARCH_WORKER_COUNT", 2))

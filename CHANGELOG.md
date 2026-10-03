@@ -81,6 +81,37 @@ after the caller's own 120 s read timeout, and both `circuit_breaker_trips` and
 - **Acceptance tests** for all six criteria in `tests/test_search_resilience.py`,
   including a replay of the incident itself.
 
+### Fixed
+
+Four defects found in post-hardening testing of the search path. All four trace
+back to one thing: the throttle wait sat between the dequeue and the job, outside
+everything the service measured, so a healthy throttle-bound queue was
+indistinguishable from a dead dispatcher — and a queue nothing was measuring
+could not be bounded, refused, or released.
+
+- **Workers reported `idle` while the queue was full.** The throttle sleep
+  (15-30 s) happened after `queue.get()` but before the job began, so a worker
+  waiting its turn looked idle with a job in hand. With the throttle longer than
+  a fetch, almost every sample showed two idle workers over a queue of five. The
+  throttle is now part of the job, and a worker in it reports `throttled`.
+- **The job deadline did not cover the queue wait**, so a job that never got
+  dispatched was never killed and its caller simply waited. A second deadline
+  (`SEARCH_QUEUE_WAIT_DEADLINE_SECONDS`) bounds the time from enqueue to
+  starting, throttle included; expiry is a fast 503, because nothing ran.
+- **The breaker could not see this.** It only learned from jobs that failed after
+  executing, so a queue that drained slowly but successfully never tripped it.
+  "Queue not empty, every worker idle" is now a checked condition
+  (`no_worker_picking_up`) that opens the breaker and refuses new work
+  immediately. It is only checkable because the throttle reports itself.
+- **`jobs_abandoned` could never increment.** Client-disconnect detection was
+  silently dead: `Request.is_disconnected()` never returns True when the app
+  wraps requests in Starlette's `BaseHTTPMiddleware`, which is what
+  `@app.middleware("http")` builds and what the request-id middleware was. Five
+  socket-level hang-ups produced zero detections across ~50 polls each. The
+  request context is now pure ASGI middleware, which passes `receive` through
+  untouched; hang-ups are detected within one poll and the worker is released
+  immediately instead of after the job deadline.
+
 ### Changed
 
 - **Pinning a quarantined engine is refused immediately** with
