@@ -48,8 +48,35 @@ class BaseParser:
 
     ENGINE_NAME: str = ""
     BASE_URL: str = ""
+    #: Market requested from the engine, as a two-letter country code. Set from
+    #: Settings.search_region at startup by apply_search_region(); parsers build
+    #: their own URL parameters from it, because each engine names the parameter
+    #: differently (and some ignore region entirely).
+    REGION: str = "us"
     # Case-insensitive substrings that mark a CAPTCHA / bot-block page.
     BLOCK_SIGNATURES: tuple[str, ...] = ()
+    # Substrings that mark a page which *never rendered its results* (a
+    # JavaScript-driven SERP captured too early, or a bot shell). Only engines
+    # that set this get the empty-result guard; leaving it empty keeps the
+    # existing behaviour, where zero results is a legitimate answer.
+    JS_SHELL_SIGNATURES: tuple[str, ...] = ()
+    #: Whether this engine returns ``site:`` results in the initial HTML.
+    #:
+    #: Measured live: DuckDuckGo, Brave and Ecosia do; Bing and Yahoo return a
+    #: 240KB shell with no result markup at all for a ``site:`` query, rendering
+    #: them client-side. Skipping them for that query shape matters because zero
+    #: parsed results otherwise look like an authoritative "nothing found" and get
+    #: cached for a day - on the one query type callers most need right.
+    SERVES_SITE_OPERATOR: bool = True
+    # Optional page to visit once in a fresh browser context, before this
+    # engine's first search. Empty for most engines.
+    #
+    # This exists for Ecosia, whose "firewall" is a cookie wall rather than an IP
+    # block: a context arriving cold at a search URL gets 403, while the same
+    # context that loaded the homepage first is served normally. Verified both
+    # ways against the live site, including with plain HTTP, which never gets
+    # through. It is opt-in because it costs one page load per context.
+    WARMUP_URL: str = ""
 
     # ------------------------------------------------------------------ URL
     @classmethod
@@ -58,19 +85,38 @@ class BaseParser:
         raise NotImplementedError
 
     # --------------------------------------------------------------- blocks
+    #: Statuses that mean the engine refused us, not that it found nothing.
+    #: This mirrors the scrape path's blocked statuses (parsers.block_detector):
+    #: without it a 403 page parses to zero results, and zero results is
+    #: indistinguishable from an authoritative "this query has no hits" - so the
+    #: refusal gets cached for a day as if it were an answer.
+    BLOCKED_STATUSES: frozenset[int] = frozenset({401, 403, 429, 503})
+
     @classmethod
     def detect_block(cls, html: str, status: int | None = None) -> str | None:
         """Return a reason string if the page looks blocked, else ``None``.
 
-        HTTP 429 and any CAPTCHA/bot-detection signature are treated as blocks.
+        Any refusal status (401/403/429/503) counts, as does any CAPTCHA or
+        bot-detection signature.
         """
-        if status == 429:
-            return "429"
+        if status is not None and status in cls.BLOCKED_STATUSES:
+            return str(status)
         lowered = (html or "").lower()
         for signature in cls.BLOCK_SIGNATURES:
             if signature in lowered:
                 return "captcha"
         return None
+
+    @classmethod
+    def looks_like_js_shell(cls, html: str) -> bool:
+        """Whether the page is a shell that never rendered any results.
+
+        For a JavaScript-rendered engine this is the difference between "the
+        query found nothing" and "we captured the page before it painted" - and
+        the second one must never be cached as an empty result set for a day.
+        """
+        lowered = (html or "").lower()
+        return any(signature in lowered for signature in cls.JS_SHELL_SIGNATURES)
 
     # -------------------------------------------------------------- parsing
     @classmethod

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import SUPPORTED_ENGINES, Settings
 from app.main import create_app
 from tests.conftest import FakeDriver, make_test_settings
 from tests.html_fixtures import ENGINE_RESULTS_HTML
@@ -27,7 +27,7 @@ def test_search_returns_clean_results(client: TestClient) -> None:
     body = resp.json()
     assert body["query"] == "python"
     assert body["cached"] is False
-    assert body["engine_used"] in {"google", "bing", "ddg", "mojeek"}
+    assert body["engine_used"] in SUPPORTED_ENGINES
     assert body["results_count"] >= 1
     assert body["results"][0]["title"]
     assert body["results"][0]["url"].startswith("http")
@@ -41,7 +41,7 @@ def test_search_missing_q_is_422(client: TestClient) -> None:
 
 
 def test_search_unknown_engine_is_422(client: TestClient) -> None:
-    resp = client.get("/search", params={"q": "x", "engine": "yahoo"})
+    resp = client.get("/search", params={"q": "x", "engine": "altavista"})
     assert resp.status_code == 422
 
 
@@ -96,12 +96,33 @@ def test_force_refresh_does_not_populate_the_cache(
     assert metrics["cache_write_skips"] >= 1
 
 
-def test_round_robin_across_engines(client: TestClient) -> None:
+def test_default_strategy_rotates_inside_the_first_group(
+    client: TestClient,
+) -> None:
+    """`grouped` is the default: the fallback group stays untouched."""
+    primary = {"ddg", "brave", "bing", "yahoo", "google"}
     engines = []
-    for i in range(4):
-        resp = client.get("/search", params={"q": f"query number {i}"})
+    for i in range(5):
+        resp = client.get("/search", params={"q": f"grouped {i}"})
         engines.append(resp.json()["engine_used"])
-    assert engines == ["google", "bing", "ddg", "mojeek"]
+    assert set(engines) == primary
+    assert "mojeek" not in engines and "ecosia" not in engines
+
+
+def test_round_robin_across_engines() -> None:
+    """Rotation order is the SUPPORTED_ENGINES order, when asked for."""
+    from fastapi.testclient import TestClient as _Client
+
+    app = create_app(
+        settings=make_test_settings(search_strategy="round_robin"),
+        driver_factory=lambda s: FakeDriver(),
+    )
+    with _Client(app) as client:
+        engines = []
+        for i in range(len(SUPPORTED_ENGINES)):
+            resp = client.get("/search", params={"q": f"query number {i}"})
+            engines.append(resp.json()["engine_used"])
+    assert engines == list(SUPPORTED_ENGINES)
 
 
 # --------------------------------------------------------------------------- circuit breaker
@@ -111,13 +132,19 @@ def test_blocked_engine_is_quarantined_and_rotation_continues(
     client: TestClient, fake_driver: FakeDriver
 ) -> None:
     # google blocks -> rotation must fall through to bing for the next query
-    fake_driver.block_engines = {"google"}
+    # Block the whole primary group: rotation must fall through to the fallback
+    # group rather than returning nothing.
+    fake_driver.block_engines = {"ddg", "brave", "bing", "yahoo", "google"}
     blocked = client.get("/search", params={"q": "first"})
-    assert blocked.json()["engine_used"] != "google"
+    assert blocked.status_code == 200
+    assert blocked.json()["engine_used"] in {"mojeek", "ecosia"}
 
     status = client.get("/status").json()["engines"]
-    assert status["google"]["status"] == "quarantined"
-    assert status["google"]["fail_count"] == 1
+    for name in ("google", "ddg", "brave", "bing", "yahoo"):
+        assert status[name]["status"] == "quarantined", name
+        assert status[name]["fail_count"] == 1, name
+    # The fallback group served the query instead.
+    assert status["ecosia"]["status"] == "active"
 
 
 def test_all_engines_quarantined_returns_503(client: TestClient, fake_driver: FakeDriver) -> None:
@@ -128,7 +155,7 @@ def test_all_engines_quarantined_returns_503(client: TestClient, fake_driver: Fa
 
 
 def test_quarantine_escalation_across_two_failures(client: TestClient, fake_driver: FakeDriver) -> None:
-    fake_driver.block_engines = {"google", "bing", "ddg", "mojeek"}
+    fake_driver.block_engines = set(SUPPORTED_ENGINES)
     # first burst: every engine fails once
     for i in range(4):
         resp = client.get("/search", params={"q": f"burst {i}"})
@@ -150,7 +177,7 @@ def test_health_endpoint(client: TestClient) -> None:
     assert body["browser_ready"] is True
     assert body["queue_depth"] == 0
     assert body["cache_entries"] == 0
-    assert set(body["active_engines"]) == {"google", "bing", "ddg", "mojeek"}
+    assert set(body["active_engines"]) == set(SUPPORTED_ENGINES)
     assert body["uptime_seconds"] >= 0
 
 
@@ -165,7 +192,7 @@ def test_status_endpoint_shape(client: TestClient) -> None:
         "breaker",
         "engines",
     }
-    assert set(body["engines"]) == {"google", "bing", "ddg", "mojeek"}
+    assert set(body["engines"]) == set(SUPPORTED_ENGINES)
     assert body["metrics"]["searches_served"] >= 1
     assert body["cached_queries_count"] == 1
 

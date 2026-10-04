@@ -33,6 +33,7 @@ from app.search_service import (
 )
 from browser_pool.manager import BrowserPoolManager
 from drivers.browser_driver import BrowserDriver, BrowserDriverError
+from drivers.parsers import apply_search_region
 from fetchers.fast_path import FastPathFetcher
 from ops.cache import ScrapeCache
 from ops.logging import configure_logging
@@ -62,6 +63,9 @@ def create_app(
     """
     settings = settings or get_settings()
     configure_logging(settings.log_format, settings.log_level)
+    # Before any traffic: engines geolocate by exit IP, so a German server would
+    # otherwise get German SERPs regardless of Accept-Language.
+    apply_search_region(settings.search_region)
 
     metrics = Registry()
     metrics.describe("muninn_http_requests_total", "counter", "HTTP requests served")
@@ -229,8 +233,8 @@ def create_app(
         openapi_tags=[
             {
                 "name": "search",
-                "description": "Execute searches across Google, Bing, DuckDuckGo "
-                "and Mojeek through a stealth browser.",
+                "description": "Execute searches across Google, Bing, DuckDuckGo, "
+                "Mojeek, Yandex and Qwant through a stealth browser.",
             },
             {
                 "name": "scrape",

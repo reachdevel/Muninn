@@ -21,12 +21,25 @@ class GoogleParser(BaseParser):
         "enable javascript and cookies",
         "not a robot",
         "our systems have detected unusual traffic",
+        # The other wall Google shows. The basic-HTML view (gbv=1) answers a
+        # 33KB consent interstitial titled "Before you continue to Google Search"
+        # rather than the usual captcha - a 33KB page with no result markup, so
+        # without this it parsed to nothing and would have been cached as an
+        # authoritative "no results".
+        "before you continue to google search",
     )
 
     @classmethod
     def search_url(cls, query: str, max_results: int = 10) -> str:
         count = max(1, min(max_results, 50))
-        return f"{cls.BASE_URL}/search?q={quote_plus(query)}&num={count}&hl=en"
+        # gl pins the *country*, not just the language: a German exit IP otherwise
+        # gets a German SERP even with hl=en. (Unverifiable from this host, which
+        # Google challenges, but both parameters are Google's documented API.)
+        region = cls.REGION.lower()
+        return (
+            f"{cls.BASE_URL}/search?q={quote_plus(query)}"
+            f"&num={count}&hl=en&gl={region}&pws=0"
+        )
 
     @classmethod
     def parse(cls, html: str, max_results: int = 10) -> list[SearchResult]:

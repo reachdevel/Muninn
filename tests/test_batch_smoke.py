@@ -29,7 +29,13 @@ TOTAL = UNIQUE_QUERIES * REPEAT_EACH
 
 def test_batch_smoke_throughput_and_cache() -> None:
     fake = FakeDriver()
-    app = create_app(settings=make_test_settings(), driver_factory=lambda s: fake)
+    # This test's purpose is to exercise *every* engine, so it asks for plain
+    # rotation: the default `grouped` strategy deliberately never touches the
+    # fallback group while the primary one is healthy.
+    app = create_app(
+        settings=make_test_settings(search_strategy="round_robin"),
+        driver_factory=lambda s: fake,
+    )
     failures: list[str] = []
 
     with TestClient(app) as client:

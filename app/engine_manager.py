@@ -8,8 +8,9 @@ Owns the per-engine state, enforces the Round-Robin selection across *active*
   ``quarantine_escalated_seconds`` (30 minutes by default).
 
 The cap is the point. The policy used to escalate straight to 12 hours, and
-because the pool is only four engines, three quarantines took the service from
-four engines to one for the best part of a day - one bad engine, no capacity.
+because the pool is small, several quarantines could take the service down to one
+engine for the best part of a day - one bad engine, no capacity. Bounded
+cooldowns keep the pool usable even when half of it is walled off.
 Bounded cooldowns with frequent re-probes keep capacity, and the exponential
 growth still means a persistently broken engine is left alone for a while.
 
@@ -34,6 +35,11 @@ import logging
 import time
 
 from app.config import SUPPORTED_ENGINES, Settings
+from app.engine_selector import (
+    AllEnginesUnavailableError,
+    EngineSelector,
+    parse_groups,
+)
 from app.engine_state_store import EngineStateStore
 from app.models import EngineState
 from ops.metrics import Registry
@@ -98,7 +104,12 @@ class EngineManager:
         self._states: dict[str, EngineState] = {
             name: EngineState(name=name) for name in SUPPORTED_ENGINES
         }
-        self._rr_index = 0
+        # Selection policy lives in EngineSelector; the manager owns the state it
+        # reads (quarantine) and the rotation position it advances.
+        self._selector = EngineSelector(
+            strategy=settings.search_strategy,
+            groups=parse_groups(settings.search_engine_groups),
+        )
         self._lock = asyncio.Lock()
 
     # -- persistence ---------------------------------------------------------
@@ -180,24 +191,32 @@ class EngineManager:
 
     # -- selection ----------------------------------------------------------
 
-    async def resolve_engine(self, requested: str | None = None) -> str:
-        """Pick the engine for the next request.
+    async def resolve_engine(
+        self, requested: str | None = None, exclude: frozenset[str] = frozenset()
+    ) -> str:
+        """Pick the engine for the next attempt of a job.
 
-        * If ``requested`` names an active engine, use it directly.
-        * Otherwise advance the Round-Robin pointer across active engines.
-        * Raise :class:`AllEnginesQuarantinedError` when nothing is active.
+        * If ``requested`` names an active engine, use it directly: a pinned
+          request must not be quietly rotated onto a different index.
+        * Otherwise apply the configured strategy (``grouped`` by default) across
+          the active engines, skipping any in ``exclude`` - that is how one job
+          tries each engine at most once.
+        * Raise :class:`AllEnginesQuarantinedError` when nothing is left.
         """
         async with self._lock:
             active = [name for name, st in self._states.items() if st.active]
             if not active:
                 raise AllEnginesQuarantinedError()
-
             if requested is not None and requested in active:
                 return requested
+            try:
+                return self._selector.select(active, exclude).engine
+            except AllEnginesUnavailableError as exc:
+                raise AllEnginesQuarantinedError() from exc
 
-            engine = active[self._rr_index % len(active)]
-            self._rr_index += 1
-            return engine
+    def selection_policy(self) -> dict[str, object]:
+        """The configured strategy and groups, for ``/status``."""
+        return self._selector.describe()
 
     # -- outcomes -----------------------------------------------------------
 
@@ -220,8 +239,9 @@ class EngineManager:
         The cooldown is ``quarantine_first_seconds`` scaled by the failure class
         and doubled per consecutive failure, capped at
         ``quarantine_escalated_seconds``. Only this engine is affected: one bad
-        engine must never take the whole pool out, because the pool is four
-        engines and losing three leaves one.
+        engine must never take the whole pool out. That matters more than it used
+        to - Yandex and Qwant sit behind SmartCaptcha and DataDome, so they are
+        expected to spend a good share of their time quarantined.
         """
         failure_class = classify_failure(reason)
         async with self._lock:

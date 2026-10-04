@@ -11,7 +11,20 @@ import os
 from dataclasses import dataclass, field
 
 # Engine pool registered for Round-Robin rotation.
-SUPPORTED_ENGINES: tuple[str, ...] = ("google", "bing", "ddg", "mojeek")
+#
+# Implemented and tested, deliberately not in the rotation: yandex and qwant both
+# answer every live probe from this host with a challenge wall rather than results
+# (SmartCaptcha and DataDome respectively), and a warm context does not change
+# either answer. Their parsers stay in drivers/parsers (and in PARSER_REGISTRY) so
+# they are one line away if another exit IP or a future approach gets through;
+# adding the name to this tuple is all it takes.
+#
+# Ecosia is here because its wall turned out to be a *cookie* wall, not an IP
+# block - the driver warms the context from the engine's WARMUP_URL and is served
+# normally. See drivers/parsers/ecosia.py for the evidence.
+SUPPORTED_ENGINES: tuple[str, ...] = (
+    "google", "bing", "ddg", "mojeek", "brave", "ecosia", "yahoo",
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -64,6 +77,37 @@ class Settings:
     search_rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int("SEARCH_RATE_LIMIT_PER_MINUTE", 30)
     )
+
+    # --- Engine selection strategy -------------------------------------------
+    # How the next engine is chosen for a job.
+    #   grouped    - round-robin inside the first group that has any usable
+    #                engine, falling back to the next group. Default, because it
+    #                keeps flaky engines off the hot path: a blocked engine in
+    #                group 1 is quarantined and skipped, while group 2 is only
+    #                touched when everything above it is out.
+    #   round_robin- plain rotation across every active engine.
+    #   priority   - try engines in SUPPORTED_ENGINES order and fall through on
+    #                failure, like a failover list.
+    search_strategy: str = field(
+        default_factory=lambda: os.environ.get("SEARCH_STRATEGY", "grouped").lower()
+    )
+    # Priority groups for the `grouped` strategy, pipe-separated and tried left to
+    # right. Any engine missing from this list is appended to a final group rather
+    # than becoming unreachable, so adding an engine cannot silently lose it.
+    search_engine_groups: str = field(
+        default_factory=lambda: os.environ.get(
+            "SEARCH_ENGINE_GROUPS", "ddg,brave,bing,yahoo,google|mojeek,ecosia"
+        )
+    )
+
+    # --- Search region -------------------------------------------------------
+    # Search engines geolocate by exit IP, so a server in Germany is shown German
+    # results first no matter what the browser's Accept-Language says. This is the
+    # market the SERPs are requested for, as a two-letter country code. It is
+    # applied per engine in drivers/parsers, and only where an engine actually
+    # honours a region parameter - see the comments there for the ones that
+    # ignore it, or break if you set it.
+    search_region: str = field(default_factory=lambda: os.environ.get("SEARCH_REGION", "us"))
 
     # --- Search job execution (P0: the worker must always be released) ------
     # Hard deadline for ONE search job: throttle wait, every engine attempt and

@@ -2,9 +2,9 @@
 
 Muninn is a lightweight, self-hosted **search and scraping API** for a home
 server. It exposes a clean REST API for web searches while a single persistent,
-anti-bot-hardened Chromium scrapes **Google**, **Bing**, **DuckDuckGo** and
-**Mojeek** for you — rotating engines, throttling traffic, and auto-quarantining
-blocked engines behind the scenes.
+anti-bot-hardened Chromium scrapes **Google**, **Bing**, **DuckDuckGo**,
+**Mojeek**, **Brave Search**, **Ecosia** and **Yahoo** for you — rotating engines,
+throttling traffic, and auto-quarantining blocked engines behind the scenes.
 
 It also ships a **`/scrape` module**: fetch any URL over plain HTTP, escalate to
 an isolated stealth-browser process when a site blocks or challenges the request
@@ -248,7 +248,7 @@ reachable by someone you would not trust with the schema.
 |------------------|---------|---------|------------------------------------------|
 | `q`              | string  | —       | required, 1–500 chars                    |
 | `max_results`    | int     | `10`    | 1–50                                     |
-| `engine`         | string  | —       | `google` \| `bing` \| `ddg` \| `mojeek`. Quarantined ⇒ immediate `503`, never silently replaced |
+| `engine`         | string  | —       | `google` \| `bing` \| `ddg` \| `mojeek` \| `brave` \| `ecosia` \| `yahoo`. Quarantined ⇒ immediate `503`, never silently replaced |
 | `force_refresh`  | bool    | `false` | bypass the cache entirely: read through the engines, do not store the result |
 
 ```bash
@@ -368,6 +368,9 @@ Everything is an environment variable; the full list with defaults lives in
 | `DOCS_ENABLED` | `true` | Serve `/docs` (Swagger UI), `/redoc` and `/openapi.json` |
 | `LOG_FORMAT` | `text` | `text` for a terminal, `json` for one JSON object per line |
 | `LOG_LEVEL` | `INFO` | Root log level |
+| `SEARCH_STRATEGY` | `grouped` | Engine selection: `grouped` (rotate inside the first group that can serve, fall back), `round_robin` (rotate across everything), `priority` (try in pool order and fall through) |
+| `SEARCH_ENGINE_GROUPS` | `ddg,brave,bing,yahoo,google\|mojeek,ecosia` | Priority groups for `grouped`, pipe-separated. An engine missing from the list is tried last, never lost |
+| `SEARCH_REGION` | `us` | Market requested from the search engines (`us`, `gb`, `de`, …). Engines geolocate by exit IP, so without this a German server gets German SERPs |
 | `CACHE_DB_PATH` | `data/cache.db` | SQLite path (`:memory:` disables disk) |
 | `CACHE_TTL_SECONDS` | `86400` | Search cache TTL |
 | `THROTTLE_MIN_DELAY` | `15` | Min seconds between outbound searches |
@@ -452,20 +455,118 @@ Example at scale — a daily budget of ~650 requests at ~22.5 s average spacing
 maps to roughly 16 h of active searching; the throttler and 24 h cache are sized
 for that workload.
 
+### Which engine serves a query
+
+`SEARCH_STRATEGY` decides that, because the right answer depends on the pool you
+have — and a pool where some engines are walled off is the normal case, not the
+exception.
+
+| Strategy | Behaviour | Use it when |
+|---|---|---|
+| **`grouped`** (default) | Round-robin inside the first group that has any usable engine, then the next group. Default groups: `ddg, brave, bing, yahoo, google` then `mojeek, ecosia` | Most setups. A blocked engine in group 1 is quarantined and skipped, and group 2 is only touched when everything above it is out |
+| `round_robin` | Plain rotation across every active engine | You trust every engine equally, and you want maximum even coverage |
+| `priority` | Try engines in `SUPPORTED_ENGINES` order and fall through on failure | Some engines are strictly better for you, and you want a failover list |
+
+A pinned `engine=` always wins: rotation policy never quietly answers a pinned
+query from a different index.
+
+The groups are yours to edit (`SEARCH_ENGINE_GROUPS`, pipe-separated). Two safety
+properties, because hand-edited config fails silently otherwise:
+
+* an engine name that is not in `SUPPORTED_ENGINES` is ignored with a warning,
+  rather than breaking every search;
+* an engine you **forget to list** is appended as a last group, so it is still
+  tried. The failure mode of forgetting is silence — an engine nobody mentions
+  looks exactly like an engine that is broken.
+
+---
+
+### Which country do the results come from?
+
+Search engines geolocate by **exit IP**, not by the browser's `Accept-Language`,
+so a server in Germany is shown German results first no matter what the locale
+says. `SEARCH_REGION` fixes that, and it is applied per engine — because each
+names the parameter differently, and some have none that works:
+
+| Engine | Applied | Verified live |
+|---|---|---|
+| `google` | `gl=` + `hl=en` | Documented; this host is challenged by Google, so unverified |
+| `bing` | `mkt=en-<CC>` + `cc=<CC>` | Yes: `us` gave AP/CNN/NBC, `gb` gave BBC/Sky |
+| `brave` | `country=<CC>` | Yes, with a catch: **only `us` and `all` are honoured** — `gb`, `de` and a bare URL all fall back to the German IP (6 of 10 results German for `"news"`). `lang=en` does nothing |
+| `ddg` | *nothing, deliberately* | `kl=` looks like the fix and breaks the engine: `kl=us-en` and `kl=uk-en` answer HTTP 202 with zero results where the bare URL answers 200 with ten, reproducibly in either order |
+| `mojeek` | *nothing* | No region parameter could be verified (this host is currently 403'd by Mojeek); Mojeek's region is a browser cookie |
+| `ecosia` | *nothing* | `locale=` and `addon=` made no measurable difference; the browser locale applies |
+| `yahoo` | `vl=lang_en` (language only) | No market parameter exists — it follows the exit IP |
+
+An invalid value is refused at startup rather than sent to every engine.
+
+### `site:` queries, and which engines can actually answer them
+
+`site:example.com` is the operator callers pin an engine for, and engines differ
+sharply on it. Measured live:
+
+| Engine | `site:` in the initial HTML |
+|---|---|
+| `ddg`, `brave`, `ecosia`, `google` | yes |
+| `bing` | **no, and worse than empty** — the page has no result markup, and what the parser does find is unrelated content (observed: army.mil and dvidshub.net for `site:example.com`, and something else entirely on a repeat). Skipped |
+| `yahoo` | **no** — a ~240 KB shell with no result markup; it renders those results client-side |
+
+Bing and Yahoo are therefore skipped for `site:`/`inurl:` queries, without being
+charged a failure. Without that, they answer with a page that parses to nothing,
+and zero results is indistinguishable from an authoritative "nothing found" — so
+the false empty answer would be cached for a day, on the one query type you most
+need right. If you pin `engine=ddg` (or `brave`) for `site:`, nothing changes; if
+you rotate, Muninn now rotates *around* the engines that cannot serve it.
+
 ---
 
 ## 5. How it works
 
 **Search.** Every uncached query becomes a job on a FIFO queue drained by a
 small worker pool, which enforces a randomized delay between outbound requests.
-The engine manager rotates engines round-robin, one job per engine at a time; a
+The engine manager picks the next engine by the configured strategy (by default:
+round-robin inside the first group that can serve, falling back to the next — see
+[which engine serves a query](#which-engine-serves-a-query)); a
 429 or CAPTCHA quarantines that engine (5 minutes, doubling per consecutive
 failure and capped at 30, scaled down for a timeout or a network error) and the
 job retries on the next active one. Quarantine state is written to SQLite, so
 restarting the service does not immediately re-hammer an engine that just
-blocked you. All four engines share one persistent Chromium, but each engine gets
+blocked you. All engines share one persistent Chromium, but each engine gets
 its own browser context, so cookies and DOM state never cross sites; every
 request opens a fresh page that is closed afterwards.
+
+**Six engines rotate today.** Google, Bing, DuckDuckGo, Mojeek and Brave Search
+serve server-rendered HTML and parse reliably, and Brave handles the `site:`
+operator. Ecosia serves real results too, but only intermittently — its wall is a
+*cookie* wall, so the driver warms each fresh context from the engine's homepage
+before searching, and even then roughly one request in three is challenged and
+quarantined. Expect it in `/status` more often than the rest; that is the circuit
+breaker earning its keep.
+
+Yandex and Qwant are implemented, tested and **parked**: both answered every live
+probe with a challenge wall rather than results (SmartCaptcha and DataDome), and a
+warm context changes neither answer. They are one edit to `SUPPORTED_ENGINES` away
+from being enabled.
+
+Both lessons from that attempt are permanent, though, because they apply to every
+engine: a challenge page is detected and charged to the engine rather than being
+read as "no results", and Muninn refuses to cache an empty result set from a page
+that never rendered — a challenge must never become "this query has no hits" for
+the next 24 hours.
+
+### Engine notes
+
+| Engine | Endpoint | Notes |
+|---|---|---|
+| `google` | `google.com/search` | Best coverage, most aggressive CAPTCHA |
+| `bing` | `bing.com/search` | Reliable; wrap-tracking links are filtered |
+| `ddg` | `html.duckduckgo.com/html` | The lightweight server-rendered endpoint, chosen because it is far more headless-friendly than the JS app |
+| `mojeek` | `mojeek.com/search` | Independent index, generous |
+| `brave` | `search.brave.com/search` | Server-rendered, handles `site:`. Careful: its page ships a localisation bundle containing the words "CAPTCHA" and "Cloudflare", so only signatures verified absent from a real response are used |
+| `yahoo` | `search.yahoo.com/search` | Server-rendered, no interstitial, no redirect wrapper — the cheapest engine here. No market parameter: it follows the exit IP |
+| `yandex` | `yandex.com/search` | **Parked, not in rotation.** SmartCaptcha ("Are you not a robot?") answered every live probe. Parser written and tested; enabling it is one line in `app/config.py` |
+| `qwant` | `qwant.com/?t=web` | **Parked, not in rotation.** DataDome answered every live probe, and results are painted client-side. Same: implemented, one line to enable |
+| `ecosia` | `www.ecosia.org/search` | Needs a warm context (`WARMUP_URL`) or the firewall 403s a cold one; still challenged on maybe 1 request in 3. Results are Google-sourced. Two parser traps: the visible breadcrumb link is the same support URL on every result, and "challenge" appears in a healthy page |
 
 Three things keep the search path from wedging — a failure it used to have, in
 which `/health` and `/scrape` stayed fast while every search returned 504 after

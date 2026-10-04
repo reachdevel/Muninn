@@ -112,7 +112,51 @@ could not be bounded, refused, or released.
   untouched; hang-ups are detected within one poll and the worker is released
   immediately instead of after the job deadline.
 
+### Fixed
+
+- **A refusal status was being cached as an empty answer.** Only HTTP 429 counted
+  as a block, so an engine answering **403** (Mojeek and Ecosia both do from this
+  host) parsed to zero results — indistinguishable from an authoritative "this
+  query has no hits" — and that false empty was cached for a day. 401/403/429/503
+  are now refusals, matching what the scrape path already treated as blocked.
+
+- **DuckDuckGo was quarantining itself on healthy pages.** Its block signatures
+  included the bare word "captcha", and DuckDuckGo serves advertisements next to
+  results — for a scraping query the ad reads "Forget about blockers with
+  automated proxy and CAPTCHA handling". Every good page matched, so a working
+  engine looked permanently blocked. The signature list now uses only specific
+  phrases, with a regression test built from the real ad text.
+
+- **Every Bing result pointed at bing.com.** Bing wraps each destination in a
+  `/ck/a?...&u=a1<base64>` click tracker, which the parser was not unwrapping, so
+  searches returned ten results with real titles and ten identical, useless URLs.
+  Found while testing region parameters, where every "result" came back with a
+  bing.com host.
+
+- **DuckDuckGo's own default was costing us the engine.** Its `kl=us-en` region
+  parameter — the obvious way to pin a market — answers HTTP 202 with zero results
+  where the bare URL answers 200 with ten, reproducibly and in either order, so
+  the parameter was quarantining a working engine as a block. Removed, with the
+  measurement recorded next to it.
+
+- **Round-robin skipped engines when the pool changed.** Selection was
+  `active[counter % len(active)]`, so quarantining the engine that had just been
+  handed out shifted every later index by one and the next engine in line was
+  skipped entirely — in a small pool, a healthy engine could go many requests
+  without being tried, which is indistinguishable from an engine nobody wants.
+  Selection now resumes from the identity of the last engine handed out, so
+  shrinkage cannot cause a skip, and a recovered engine rejoins in turn.
+
 ### Changed
+
+- **`site:` queries no longer risk a cached false empty.** Bing and Yahoo render
+  `site:` results client-side: their initial HTML has no result markup, so a
+  `site:` search against them parses to nothing and — because zero results is
+  indistinguishable from an authoritative "nothing found" — that would have been
+  cached for a day on the one query type callers most need right. Those two
+  engines are now skipped for `site:`/`inurl:` queries, cheaply and without
+  charging them a failure, since a capability difference is not an engine
+  misbehaving.
 
 - **Pinning a quarantined engine is refused immediately** with
   `503 {"error": "engine_quarantined", "engine": "ddg"}` instead of being
@@ -128,6 +172,87 @@ could not be bounded, refused, or released.
   breaker, which is exactly how a breaker latches forever.
 - The service warns at startup when the throttle plus the job deadline can exceed
   `REQUEST_TIMEOUT_SECONDS`, because callers give up before the worker does.
+
+### Added
+
+- **Configurable engine selection** (`SEARCH_STRATEGY`, `SEARCH_ENGINE_GROUPS`),
+  because a pool where some engines are walled off is the normal case:
+
+  * `grouped` (default) — round-robin inside the first group that has any usable
+    engine, then the next. Default groups are `ddg, brave, bing, yahoo, google`
+    and `mojeek, ecosia`, which keeps flaky engines off the hot path instead of
+    removing them: an engine in group 1 that blocks is quarantined and skipped,
+    while group 2 is only touched once everything above it is out.
+  * `round_robin` — plain rotation across every active engine.
+  * `priority` — try engines in `SUPPORTED_ENGINES` order and fall through on
+    failure, like a failover list.
+
+  A pinned `engine=` still wins, so a policy change can never quietly answer a
+  pinned query from a different index. Hand-edited group config fails safe in
+  both directions: an unknown name is ignored with a warning, and an engine you
+  forget to list is tried last rather than never. The retry loop now passes the
+  engines a job has already tried, so no strategy has to encode retry semantics.
+
+- **Google's other wall is detected.** The basic-HTML view (`gbv=1`) answers a
+  33KB consent interstitial — "Before you continue to Google Search" — rather
+  than the usual captcha. It has no result markup, so it parsed to nothing and
+  would have been cached as an authoritative "no results". That marker is now a
+  block signature too.
+
+- **Yahoo Search joins the pool** (`yahoo`). Server-rendered results, no
+  interstitial in front of them and no click-tracking wrapper to unwrap — the
+  cheapest engine here to scrape. Its market follows the exit IP; there is no
+  parameter that moves it.
+
+- **`SEARCH_REGION` fixes geolocation.** Engines geolocate by exit IP, so a server
+  in Germany was shown German results regardless of `Accept-Language`. Applied per
+  engine, and the README table records what each one actually honours — verified
+  live rather than assumed: Bing's `mkt`/`cc` moves the market cleanly, Brave
+  honours `country` *only* for `us` and `all` (anything else falls back to the
+  German IP), DuckDuckGo's `kl=` is left off because it breaks the engine outright,
+  and Mojeek, Ecosia and Yahoo have no parameter that could be verified. An invalid
+  code is refused at startup rather than sent to every engine.
+
+- **Brave Search joins the pool** (`brave`). Server-rendered results in the initial
+  HTML, verified live through the real driver, and it handles the `site:`
+  operator. Its block signatures were each checked against a working response,
+  which matters here: Brave ships a localisation bundle inside the page
+  containing the words "CAPTCHA", "Cloudflare" and "rate limit", so a
+  conventional signature list would have quarantined this engine on *every*
+  request. The parser never references the per-build `svelte-<hash>` classes.
+
+- **Ecosia joins the pool** (`ecosia`), after working out what its wall actually
+  was. It is a *cookie* wall, not an IP block: a browser context arriving cold at
+  a search URL gets HTTP 403 and an "Ecosia Firewall" page, while the same context
+  that loaded the homepage first is served a full SERP — verified both ways,
+  including with plain HTTP, which is challenged whatever headers it sends.
+  Engines may now declare a `WARMUP_URL`, and the driver visits it once per
+  context (settling the page first, or the consent script has not run and the
+  warm-up achieves nothing). Even warmed it is challenged on roughly one request
+  in three, which the circuit breaker absorbs as a normal per-engine block.
+
+  Its parser is written against a real response, which caught two things that
+  would otherwise have shipped broken: the visible breadcrumb link is the *same*
+  support-article URL on every result (selecting "any absolute link" returns one
+  URL ten times), and the words "challenge" and "enable javascript" appear in a
+  perfectly healthy page, so using them as block signatures would have quarantined
+  the engine on every successful search.
+
+- **Yandex and Qwant parsers, parked rather than enabled.** Both are
+  implemented, tested and registered in `PARSER_REGISTRY`, and both are left out
+  of `SUPPORTED_ENGINES` on purpose: Yandex answers with SmartCaptcha ("Are you
+  not a robot?") and Qwant with a DataDome interstitial, verified against live
+  requests through the real driver. Neither returned a single organic result, so
+  enabling them would have added a guaranteed-failing attempt to every search.
+  Their block signatures come from those captured responses rather than from
+  guesswork, and enabling either is a single edit to `SUPPORTED_ENGINES`.
+
+- **An empty result set from a page that never rendered is now a block, not an
+  answer.** Yandex and Qwant are JavaScript-rendered, so a capture can land
+  before the results paint — or on a bot challenge. Reporting that as "0 results"
+  would have cached a wrong answer for 24 hours and logged a successful search.
+  Engines opt in via `JS_SHELL_SIGNATURES`; the server-rendered four are
+  unchanged, where a genuinely empty SERP is still a valid answer.
 
 ## [0.1.0] - 2026-09-26
 

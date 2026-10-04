@@ -34,15 +34,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.cache import SearchCache
-from app.config import Settings
+from app.config import SUPPORTED_ENGINES, Settings
 from app.engine_manager import EngineManager
 from app.search_service import (
+    EngineQuarantinedError,
     SearchJob,
     SearchJobFailedError,
     SearchQueueFullError,
     SearchService,
     SearchUnavailableError,
 )
+from drivers.parsers import BingParser
 from tests.conftest import make_test_settings
 from tests.html_fixtures import BLOCK_PAGES, ENGINE_RESULTS_HTML
 
@@ -124,10 +126,14 @@ async def test_a_hung_engine_is_killed_at_the_deadline_and_the_worker_is_release
         quarantine_escalated_seconds=1,
     )
     try:
+        # Pinned, so rotation cannot route around the hang: with the default
+        # strategy a hung engine in the first group is simply skipped and the job
+        # succeeds elsewhere, which is the resilience working - but then there is
+        # no deadline to observe.
         started = perf_counter()
         with pytest.raises(SearchJobFailedError):
             await service.submit(query="hung", max_results=10,
-                                 requested_engine=None, force_refresh=False)
+                                 requested_engine="google", force_refresh=False)
         elapsed = perf_counter() - started
 
         # Killed at the deadline, not at REQUEST_TIMEOUT_SECONDS.
@@ -136,7 +142,7 @@ async def test_a_hung_engine_is_killed_at_the_deadline_and_the_worker_is_release
         # The hung engine took the failure...
         assert engines._states["google"].fail_count == 1  # noqa: SLF001
         # ...and the pool is still a pool.
-        assert set(engines.active_engines()) == {"google", "bing", "ddg", "mojeek"}
+        assert set(engines.active_engines()) == set(SUPPORTED_ENGINES)
 
         # The worker was released, so the next search is served normally.
         driver.hang = set()
@@ -272,7 +278,7 @@ async def test_the_breaker_refuses_in_milliseconds_and_recovers_on_its_probe() -
         # One deadline kill trips the breaker.
         with pytest.raises(SearchJobFailedError):
             await service.submit(query="trip it", max_results=10,
-                                 requested_engine=None, force_refresh=False)
+                                 requested_engine="google", force_refresh=False)
         assert service.breaker.state == "open"
 
         # While it is refusing, new work is turned away immediately.
@@ -326,15 +332,14 @@ async def test_a_failed_probe_reopens_the_breaker_with_a_longer_backoff() -> Non
     try:
         with pytest.raises(SearchJobFailedError):
             await service.submit(query="trip", max_results=10,
-                                 requested_engine=None, force_refresh=False)
+                                 requested_engine="google", force_refresh=False)
         first_backoff = float(service.breaker.snapshot()["backoff_seconds"])
 
         # The probe hangs too, so it hits the deadline instead of recovering.
         await asyncio.sleep(0.25)
-        driver.hang = {"bing"}
         with pytest.raises(SearchJobFailedError):
             await service.submit(query="failing probe", max_results=10,
-                                 requested_engine=None, force_refresh=False)
+                                 requested_engine="google", force_refresh=False)
         assert service.breaker.state == "open"
         assert float(service.breaker.snapshot()["backoff_seconds"]) > first_backoff
     finally:
@@ -344,11 +349,14 @@ async def test_a_failed_probe_reopens_the_breaker_with_a_longer_backoff() -> Non
 async def test_a_full_queue_is_refused_rather_than_waited_on() -> None:
     """A queue that cannot drain must not accumulate promises."""
     driver = ControllableDriver()
-    driver.hang = {"google"}
+    # Rotation routes around a hung engine, so the queue can only fill when every
+    # engine it could reach is busy. One worker, everything hung.
+    driver.hang = set(SUPPORTED_ENGINES)
     service, _engines, _settings = await make_service(
         driver,
         max_search_queue=2,
         search_job_deadline_seconds=1,
+        search_queue_wait_deadline_seconds=30,
         search_worker_count=1,
     )
     try:
@@ -522,7 +530,7 @@ async def test_one_failing_engine_does_not_reduce_healthy_capacity() -> None:
         assert "google" not in served_by, "a quarantined engine was still used"
         # google is out; the healthy engines are all still in rotation.
         assert "google" not in engines.active_engines()
-        assert set(engines.active_engines()) == {"bing", "ddg", "mojeek"}
+        assert set(engines.active_engines()) == set(SUPPORTED_ENGINES) - {"google"}
 
         # And every cooldown in the pool is bounded by the configured cap.
         for state in engines._states.values():  # noqa: SLF001
@@ -695,7 +703,9 @@ def test_the_metrics_explain_the_next_wedge() -> None:
     with TestClient(
         _app(driver, search_job_deadline_seconds=0.25, search_worker_count=1)
     ) as client:
-        assert client.get("/search", params={"q": "hangs"}).status_code == 504
+        # Pinned: unpinned, the grouped strategy routes straight past the hang.
+        resp = client.get("/search", params={"q": "hangs", "engine": "google"})
+        assert resp.status_code == 504
         text = client.get("/metrics").text
 
     assert 'muninn_search_deadline_kills_total{engine="google"} 1' in text
@@ -737,10 +747,10 @@ def test_status_codes_keep_their_meaning() -> None:
         # 422: the query is invalid; the client skips it and carries on.
         assert client.get("/search").status_code == 422
         assert client.get("/search", params={"q": ""}).status_code == 422
-        assert client.get("/search", params={"q": "x", "engine": "yahoo"}).status_code == 422
+        assert client.get("/search", params={"q": "x", "engine": "altavista"}).status_code == 422
 
         # 503: no engine left to serve it.
-        driver.block = {"google", "bing", "ddg", "mojeek"}
+        driver.block = set(SUPPORTED_ENGINES)
         assert client.get("/search", params={"q": "blocked"}).status_code == 503
 
 
@@ -767,7 +777,8 @@ def test_504_is_a_job_that_ran_and_failed_not_a_refusal() -> None:
         _app(driver, search_job_deadline_seconds=0.25, search_worker_count=1)
     ) as client:
         started = perf_counter()
-        resp = client.get("/search", params={"q": "will not answer"})
+        # Pinned: unpinned, the grouped strategy routes straight past the hang.
+        resp = client.get("/search", params={"q": "will not answer", "engine": "google"})
         assert resp.status_code == 504
         assert perf_counter() - started < 5, "the job deadline must bound this"
         assert "deadline" in resp.json()["detail"]
@@ -778,12 +789,13 @@ def test_a_refusal_carries_a_machine_readable_reason() -> None:
     import threading
 
     driver = ControllableDriver()
-    driver.hang = {"google"}
+    driver.hang = set(SUPPORTED_ENGINES)
     with TestClient(
         _app(
             driver,
             max_search_queue=1,
             search_job_deadline_seconds=2,
+            search_queue_wait_deadline_seconds=30,
             search_worker_count=1,
         )
     ) as client:
@@ -1040,3 +1052,163 @@ def test_the_app_middleware_does_not_swallow_client_disconnects() -> None:
             f"{layer.cls.__name__} is a BaseHTTPMiddleware: /search cannot see a "
             f"client disconnect through it"
         )
+
+
+# ------------------------------------------------------ yandex / qwant behaviour
+
+
+async def test_a_blocked_engine_does_not_stop_the_others_or_poison_the_cache() -> None:
+    """One walled engine must not take the pool with it.
+
+    Every engine Muninn adds sits behind some form of anti-bot, so this property
+    is the one that decides whether the pool is worth extending at all: the
+    blocked engine takes exactly one failure, the job lands on a healthy engine,
+    and the block page is never cached as an answer.
+
+    The loop drives until the blocked engine has actually been attempted, rather
+    than assuming where round-robin lands once the active list starts shrinking.
+    """
+    from tests.html_fixtures import BLOCK_PAGES, ENGINE_RESULTS_HTML
+
+    # A primary-group engine, so it really is on the hot path and really is
+    # charged. (The grouped strategy is covered in test_engine_selection.py.)
+    walled = "brave"
+
+    class PartialBlockDriver(ControllableDriver):
+        async def fetch_html(self, url: str, engine: str = "") -> tuple[str, int]:
+            self.calls.append(engine)
+            self.starts.append(time.monotonic())
+            if engine == walled:
+                return BLOCK_PAGES[engine], 200
+            return ENGINE_RESULTS_HTML[engine], 200
+
+    driver = PartialBlockDriver()
+    service, engines, _settings = await make_service(
+        driver, quarantine_first_seconds=300, quarantine_escalated_seconds=300
+    )
+    try:
+        served = 0
+        for i in range(len(SUPPORTED_ENGINES) * 4):
+            response = await service.submit(query=f"pool {i}", max_results=10,
+                                            requested_engine=None, force_refresh=False)
+            assert response.results_count >= 1, "a blocked engine starved the job"
+            assert response.engine_used != walled
+            served += 1
+            if engines._states[walled].fail_count:
+                break
+        assert engines._states[walled].fail_count >= 1
+
+        state = engines._states[walled]  # noqa: SLF001
+        assert state.fail_count == 1, f"{walled} was never charged"
+        assert state.last_failure_class == "block"
+        assert state.active is False, "a blocked engine stays in rotation"
+
+        # The rest of the pool is untouched - including the fallback group, which
+        # the grouped strategy never reaches while the primary one can serve.
+        assert set(engines.active_engines()) == set(SUPPORTED_ENGINES) - {walled}
+        assert engines._states["mojeek"].fail_count == 0
+        assert engines._states["ecosia"].fail_count == 0
+        # ...and every answer came from a healthy engine, none from a block page.
+        assert await service._cache.count() == served  # noqa: SLF001
+    finally:
+        await stop_service(service)
+
+
+async def test_a_pinned_engine_that_blocks_mid_job_is_refused_not_substituted() -> None:
+    """A pin is a question, not a preference.
+
+    The caller named an engine because it wanted that index (a `site:` query, a
+    locale). When it blocks, another engine's results answer a different question,
+    so the request fails with 503 instead of quietly changing the subject.
+    """
+    driver = ControllableDriver()
+    driver.block = {"ddg"}
+    service, _engines, _settings = await make_service(driver)
+    try:
+        with pytest.raises(EngineQuarantinedError) as caught:
+            await service.submit(query="site:example.com", max_results=10,
+                                 requested_engine="ddg", force_refresh=False)
+        assert caught.value.engine == "ddg"
+
+        # Unpinned, the same block just rotates.
+        served = await service.submit(query="unpinned", max_results=10,
+                                      requested_engine=None, force_refresh=False)
+        assert served.engine_used != "ddg"
+        assert served.results_count >= 1
+    finally:
+        await stop_service(service)
+
+
+async def test_an_unrendered_page_is_a_block_not_an_empty_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The JavaScript-SERP trap, exercised through the real execution path.
+
+    An engine that renders client-side can hand us a page with no results simply
+    because we captured it too early. Caching that would serve a wrong answer for
+    a day and report a successful search, so it is charged to the engine instead.
+
+    The opt-in is set on the parked Yandex and Qwant parsers, which are not in the
+    rotation, so this drives an in-pool engine with the flag turned on: what is
+    under test is the guard in the execution path, not a particular parser.
+    """
+    from drivers.parsers import GoogleParser
+    from tests.html_fixtures import QWANT_JS_SHELL_HTML
+
+    monkeypatch.setattr(GoogleParser, "JS_SHELL_SIGNATURES", ("noscript",))
+
+    class ShellDriver(ControllableDriver):
+        async def fetch_html(self, url: str, engine: str = "") -> tuple[str, int]:
+            self.calls.append(engine)
+            if engine == "google":
+                return QWANT_JS_SHELL_HTML, 200
+            from tests.html_fixtures import ENGINE_RESULTS_HTML
+            return ENGINE_RESULTS_HTML[engine], 200
+
+    driver = ShellDriver()
+    service, engines, _settings = await make_service(driver)
+    try:
+        served = 0
+        for i in range(len(SUPPORTED_ENGINES) * 4):
+            response = await service.submit(query=f"shell {i}", max_results=10,
+                                            requested_engine=None, force_refresh=False)
+            assert response.engine_used != "google", "an unrendered page counted as a search"
+            served += 1
+            if "google" in driver.calls:
+                break
+
+        # Charged to the engine as a failure, so it drops out of rotation...
+        assert engines._states["google"].fail_count == 1  # noqa: SLF001
+        assert "google" not in engines.active_engines()
+        # ...and the shell contributed nothing to the cache.
+        assert await service._cache.count() == served  # noqa: SLF001
+    finally:
+        await stop_service(service)
+
+
+async def test_a_site_query_skips_engines_that_render_those_results_client_side() -> None:
+    """A `site:` query must not be answered from a shell that parses to nothing.
+
+    Bing and Yahoo return a 240KB shell with no result markup for `site:`
+    queries. Treating that as "no results" would cache a false empty answer for a
+    day, on the query type callers most need right - so those engines are skipped
+    for that shape, cheaply and without being charged a failure.
+    """
+    from app.search_service import _uses_site_operator
+
+    assert _uses_site_operator("site:example.com")
+    assert BingParser.SERVES_SITE_OPERATOR is False
+
+    driver = ControllableDriver()
+    service, engines, _settings = await make_service(driver)
+    try:
+        response = await service.submit(query="site:example.com", max_results=10,
+                                        requested_engine=None, force_refresh=False)
+        # DuckDuckGo serves site: queries server-side, so the job lands there.
+        assert response.engine_used not in {"bing", "yahoo"}
+        assert response.results_count >= 1
+        # Skipping is not a failure: nothing was charged to the skipped engines.
+        assert engines._states["bing"].fail_count == 0  # noqa: SLF001
+        assert engines._states["yahoo"].fail_count == 0  # noqa: SLF001
+    finally:
+        await stop_service(service)

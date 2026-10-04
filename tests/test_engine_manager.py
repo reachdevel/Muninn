@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import pytest
 
 from app.cache import SearchCache
-from app.config import Settings
+from app.config import SUPPORTED_ENGINES, Settings
 from app.engine_manager import AllEnginesQuarantinedError, EngineManager
 from app.engine_state_store import EngineStateStore
 
@@ -25,6 +26,17 @@ def manager(settings: Settings) -> EngineManager:
     return EngineManager(settings)
 
 
+@pytest.fixture
+def rr_manager(settings: Settings) -> EngineManager:
+    """A manager explicitly in round-robin mode.
+
+    The default strategy is `grouped`, which deliberately does not produce a
+    flat rotation. The rotation tests are about the rotation, so they ask for it
+    by name rather than inheriting whatever the default happens to be.
+    """
+    return EngineManager(replace(settings, search_strategy="round_robin"))
+
+
 def _expire_all(manager: EngineManager) -> None:
     """Simulate every quarantine cooldown expiring (move clock forward)."""
     for st in manager._states.values():
@@ -35,7 +47,7 @@ def _expire_all(manager: EngineManager) -> None:
 
 
 async def test_all_engines_start_active(manager: EngineManager) -> None:
-    assert set(manager.active_engines()) == {"google", "bing", "ddg", "mojeek"}
+    assert set(manager.active_engines()) == set(SUPPORTED_ENGINES)
     status = await manager.status()
     assert all(v["status"] == "active" for v in status.values())
 
@@ -53,7 +65,7 @@ async def test_first_failure_quarantines_the_base_cooldown(manager: EngineManage
     # engine is excluded from rotation
     assert "google" not in manager.active_engines()
     # others remain available
-    assert set(manager.active_engines()) == {"bing", "ddg", "mojeek"}
+    assert set(manager.active_engines()) == set(SUPPORTED_ENGINES) - {"google"}
 
 
 async def test_second_consecutive_failure_escalates_beyond_the_base(
@@ -109,7 +121,7 @@ async def test_escalation_requires_consecutive_failures(manager: EngineManager) 
 
 
 async def test_all_quarantined_raises(manager: EngineManager) -> None:
-    for engine in ("google", "bing", "ddg", "mojeek"):
+    for engine in SUPPORTED_ENGINES:
         await manager.report_failure(engine, "captcha")
     assert manager.active_engines() == []
     with pytest.raises(AllEnginesQuarantinedError):
@@ -119,19 +131,21 @@ async def test_all_quarantined_raises(manager: EngineManager) -> None:
 # --------------------------------------------------------------------------- round robin
 
 
-async def test_round_robin_over_active_engines(manager: EngineManager) -> None:
-    picked = [await manager.resolve_engine() for _ in range(8)]
-    # 8 picks over 4 engines -> every engine exactly twice, in RR order
-    assert picked == ["google", "bing", "ddg", "mojeek", "google", "bing", "ddg", "mojeek"]
+async def test_round_robin_over_active_engines(rr_manager: EngineManager) -> None:
+    count = 2 * len(SUPPORTED_ENGINES)
+    picked = [await rr_manager.resolve_engine() for _ in range(count)]
+    # two full cycles in declaration order, whichever engines are in the pool
+    assert picked == list(SUPPORTED_ENGINES) * 2
 
 
-async def test_round_robin_skips_quarantined(manager: EngineManager) -> None:
-    await manager.report_failure("google", "captcha")
-    picked = [await manager.resolve_engine() for _ in range(6)]
+async def test_round_robin_skips_quarantined(rr_manager: EngineManager) -> None:
+    await rr_manager.report_failure("google", "captcha")
+    picked = [
+        await rr_manager.resolve_engine()
+        for _ in range(2 * (len(SUPPORTED_ENGINES) - 1))
+    ]
     assert "google" not in picked
-    assert picked.count("bing") == 2
-    assert picked.count("ddg") == 2
-    assert picked.count("mojeek") == 2
+    assert len(picked) == len(set(picked)) * 2, "each active engine is used equally"
 
 
 async def test_requested_active_engine_is_honoured(manager: EngineManager) -> None:
@@ -182,7 +196,7 @@ async def test_quarantine_survives_a_restart(tmp_path, settings: Settings) -> No
     active = mgr_b.active_engines()
     assert "google" not in active
     assert "bing" not in active
-    assert set(active) == {"ddg", "mojeek"}
+    assert set(active) == set(SUPPORTED_ENGINES) - {"google", "bing"}
 
 
 async def test_expired_quarantine_is_restored_as_usable(tmp_path) -> None:

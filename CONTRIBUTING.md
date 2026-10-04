@@ -99,7 +99,7 @@ mode that no offline test can catch, because the tests run against saved HTML.
 
 Check it in this order:
 
-1. Run the live probe — it exercises all four engines with one real query:
+1. Run the live probe — it exercises every engine with one real query each:
 
    ```bash
    LIVE=1 python scripts/live_probe.py "python web scraping"

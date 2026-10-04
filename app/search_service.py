@@ -43,6 +43,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -64,6 +65,14 @@ from drivers.parsers import EngineBlockedError, get_parser
 from ops.metrics import Registry
 
 logger = logging.getLogger(__name__)
+
+#: `site:` (and `inurl:`) restrict a query to one domain. Callers use them
+#: deliberately - it is the operator a client pins an engine for.
+_SITE_OPERATOR = re.compile(r"(?:^|\s)(?:site|inurl):\S+", re.IGNORECASE)
+
+
+def _uses_site_operator(query: str) -> bool:
+    return bool(_SITE_OPERATOR.search(query or ""))
 
 #: Worker states, mirrored by the ``muninn_search_worker_state`` gauge.
 WORKER_IDLE = "idle"
@@ -695,6 +704,11 @@ class SearchService:
                 task.cancel()
             if self._stopping:
                 raise
+        except EngineQuarantinedError as exc:
+            # The engine the caller pinned blocked mid-job. Nothing failed except
+            # that engine, so this is "not now" (503), not a job failure (504).
+            outcome = "pinned_quarantined"
+            error = exc
         except AllEnginesQuarantinedError as exc:
             outcome = "quarantined"
             error = exc
@@ -710,7 +724,7 @@ class SearchService:
                 worker.jobs_completed += 1
             elif outcome == "deadline":
                 worker.jobs_killed += 1
-            if outcome in {"served", "quarantined", "failed"}:
+            if outcome in {"served", "quarantined", "pinned_quarantined", "failed"}:
                 # The worker picked the job up and released it, so the path is
                 # draining whatever the job's own outcome was. This is also the
                 # only thing that closes a half-open breaker.
@@ -809,10 +823,27 @@ class SearchService:
         await self._throttle(job)
         job.started_at = time.monotonic()
         engine_pool_size = len(self._engines.engines)
+        # Each attempt excludes the engines this job has already tried, so a retry
+        # never lands on the same engine twice - which lets the selection
+        # strategy stay as simple as "give me the next one".
+        tried: frozenset[str] = frozenset()
         for _ in range(engine_pool_size):
-            engine = await self._reserve_engine(job.requested_engine)
+            engine = await self._reserve_engine(job.requested_engine, tried)
             job.engine_in_flight = engine
             parser = get_parser(engine)
+            if _uses_site_operator(job.query) and not parser.SERVES_SITE_OPERATOR:
+                # This engine renders `site:` results client-side, so asking it
+                # yields a shell that parses to nothing - which would be cached
+                # as "this query has no hits" for a day. Skip it, cheaply and
+                # without charging it a failure: a capability difference is not
+                # the engine misbehaving.
+                logger.debug(
+                    "engine=%s skipped: no server-rendered results for site: queries",
+                    engine,
+                )
+                self._release_engine(engine)
+                tried = tried | {engine}
+                continue
             url = parser.search_url(job.query, job.max_results)
             try:
                 started = perf_counter()
@@ -832,6 +863,11 @@ class SearchService:
                     raise EngineBlockedError(engine, block_reason)
 
                 results = parser.parse(html, job.max_results)
+                if not results and parser.looks_like_js_shell(html):
+                    # A page that never rendered is a block, not an empty SERP.
+                    # Caching "no results" here would serve a wrong answer for a
+                    # day, and it would look like a successful search.
+                    raise EngineBlockedError(engine, "js-shell")
                 await self._engines.report_success(engine)
                 job.engine_in_flight = None
                 if job.force_refresh:
@@ -858,8 +894,15 @@ class SearchService:
                 )
             except EngineBlockedError as exc:
                 await self._engines.report_failure(engine, exc.reason)
-                # Job.requested_engine is quarantined now; the next iteration
-                # resolves a fresh engine via Round-Robin.
+                tried = tried | {engine}
+                if job.requested_engine is not None:
+                    # The caller pinned this engine because it wanted *this*
+                    # engine - a `site:` query, a locale, an index it trusts.
+                    # It has just blocked us, so the answer they wanted cannot be
+                    # produced, and another engine's results are not a substitute:
+                    # they would answer a different question. Say so instead.
+                    raise EngineQuarantinedError(job.requested_engine) from exc
+                # Unpinned: quarantine now, rotate to the next active engine.
                 continue
             except AllEnginesQuarantinedError:
                 raise
@@ -869,7 +912,9 @@ class SearchService:
 
     # -- per-engine concurrency (isolation) ---------------------------------
 
-    async def _reserve_engine(self, requested: str | None) -> str:
+    async def _reserve_engine(
+        self, requested: str | None, exclude: frozenset[str] = frozenset()
+    ) -> str:
         """Pick an engine and hold its per-engine slot for the duration.
 
         Rotation prefers an engine with a free slot, so a slow or hanging engine
@@ -877,12 +922,12 @@ class SearchService:
         """
         cap = max(1, self._settings.search_max_concurrent_per_engine)
         for _ in range(max(1, len(self._engines.engines))):
-            engine = await self._engines.resolve_engine(requested)
+            engine = await self._engines.resolve_engine(requested, exclude)
             if self._inflight.get(engine, 0) < cap:
                 self._inflight[engine] = self._inflight.get(engine, 0) + 1
                 return engine
             # Every slot is taken: rotate and try the next engine.
-        engine = await self._engines.resolve_engine(requested)
+        engine = await self._engines.resolve_engine(requested, exclude)
         self._inflight[engine] = self._inflight.get(engine, 0) + 1
         logger.debug("engine=%s is at its concurrency cap; overloading it", engine)
         return engine

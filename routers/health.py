@@ -75,7 +75,7 @@ def _verdict(active: list[str], pool_status: PoolStatus, breaker_state: str) -> 
                         "browser_ready": True,
                         "queue_depth": 0,
                         "cache_entries": 42,
-                        "active_engines": ["google", "bing", "ddg", "mojeek"],
+                        "active_engines": ["google", "bing", "ddg", "mojeek", "yandex", "qwant"],
                         "quarantined_engines": [],
                         "uptime_seconds": 3600,
                         "worker": {
@@ -226,7 +226,7 @@ async def health_live(request: Request) -> dict[str, Any]:
                     "example": {
                         "status": "ok",
                         "ready": True,
-                        "active_engines": ["google", "bing", "ddg", "mojeek"],
+                        "active_engines": ["google", "bing", "ddg", "mojeek", "yandex", "qwant"],
                         "breaker": {"state": "closed", "reason": None},
                     }
                 }

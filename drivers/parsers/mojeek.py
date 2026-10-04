@@ -26,6 +26,9 @@ class MojeekParser(BaseParser):
 
     @classmethod
     def search_url(cls, query: str, max_results: int = 10) -> str:
+        # Mojeek has no region parameter that could be verified (this host is
+        # currently 403'd by Mojeek), and its region is a browser cookie rather
+        # than a query argument. Left as-is deliberately.
         return f"{cls.BASE_URL}/search?q={quote_plus(query)}"
 
     @classmethod

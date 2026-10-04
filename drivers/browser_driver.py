@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 from playwright.async_api import TimeoutError as PWTimeoutError
@@ -102,7 +103,48 @@ class BrowserDriver:
                 )
                 self._contexts[engine] = context
                 logger.debug("created browser context for engine=%s", engine)
+                await self._warm_up(engine, context)
             return context
+
+    async def _warm_up(self, engine: str, context: BrowserContext) -> None:
+        """Load the engine's warm-up page once per context, if it declares one.
+
+        Best effort by design: a failed warm-up must not fail the search that
+        follows, since for most engines it does not exist and for the rest it only
+        improves the odds. Its cost is one extra page load, once per context.
+        """
+        warmup_url = ""
+        try:
+            from drivers.parsers import get_parser
+
+            warmup_url = get_parser(engine).WARMUP_URL
+        except KeyError:
+            return
+        except Exception:  # pragma: no cover - never let a warm-up break a search
+            logger.debug("could not resolve a warm-up url for engine=%s", engine, exc_info=True)
+            return
+        if not warmup_url:
+            return
+        page: Page | None = None
+        try:
+            page = await context.new_page()
+            await page.goto(
+                warmup_url,
+                wait_until="domcontentloaded",
+                timeout=self._settings.navigation_timeout_ms,
+            )
+            # Settle exactly as a real page load does. Closing at domcontentloaded
+            # is not enough: Ecosia's consent script has not run yet, so no
+            # cookies are stored, and the search that follows gets the firewall -
+            # which made the warm-up work only intermittently.
+            await _settle(page)
+            logger.debug("warmed up engine=%s via %s", engine, warmup_url)
+        except Exception:
+            logger.debug("warm-up failed for engine=%s via %s", engine, warmup_url, exc_info=True)
+        finally:
+            if page is not None:
+                with suppress(Exception):
+                    await page.close()
 
     async def stop(self) -> None:
         """Tear down every context, the browser, and the playwright session."""
