@@ -279,13 +279,24 @@ class Settings:
     log_format: str = field(default_factory=lambda: os.environ.get("LOG_FORMAT", "text"))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
 
-
     def browser_launch_args(self) -> list[str]:
         """Chromium flags for both browser launch sites."""
         args = list(self.browser_args)
         if self.browser_no_sandbox:
             args.append("--no-sandbox")
-        return args
+        
+        # Düşük RAM optimizasyonu için eklenen bayraklar
+        low_resource_flags = [
+            "--disable-audio",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-zygote",
+        ]
+        for flag in low_resource_flags:
+            if flag not in args:
+                args.append(flag)
+
+        return args    
 
 
 def get_settings() -> Settings:
